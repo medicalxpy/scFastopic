@@ -1,399 +1,455 @@
 #!/usr/bin/env python3
 """
-scFASTopic 可视化模块
+scFASTopic Results Visualization
+
+根据文件路径自动识别结果类型并进行相应的可视化
+支持的结果类型：
+- cell embeddings
+- cell topic matrix  
+- gene embeddings
+- topic embeddings
+- topic gene matrix
 """
 
+import os
+import pickle
 import numpy as np
-import pandas as pd
 import matplotlib.pyplot as plt
-import seaborn as sns
+import scanpy as sc
 import umap
 from pathlib import Path
-from typing import Dict, Optional, List
-import pickle
+from typing import Dict, Any, Optional, List
+import argparse
+import warnings
+warnings.filterwarnings('ignore')
 
-class ScFastopicVisualizer:
-    """scFASTopic可视化器"""
+class ResultVisualizer:
+    """结果可视化器"""
     
-    def __init__(self, output_dir: str = "visualization"):
+    def __init__(self, output_dir: str = "visualization", adata_path: Optional[str] = None):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(exist_ok=True)
+        self.adata_path = adata_path
+        self.adata = None
         
-        # 设置matplotlib样式
-        plt.style.use('default')
-        sns.set_palette("husl")
+        # 支持的结果类型（主要通过目录识别）
+        self.supported_types = {
+            'cell_embedding',
+            'cell_topic', 
+            'gene_embedding',
+            'topic_embedding',
+            'topic_gene'
+        }
         
-    def load_matrices(self, 
-                     dataset_name: str, 
-                     n_topics: int,
-                     results_dir: str = "results") -> Dict[str, np.ndarray]:
+        # 加载adata（如果提供了路径）
+        if self.adata_path and os.path.exists(self.adata_path):
+            self.load_adata()
+    
+    def identify_result_type(self, file_path: str) -> str:
+        """根据文件目录路径识别结果类型"""
+        path_obj = Path(file_path)
+        
+        # 检查文件所在的目录名
+        parent_dirs = [p.name for p in path_obj.parents] + [path_obj.parent.name]
+        
+        # 目录名到结果类型的映射
+        dir_type_mapping = {
+            'cell_embedding': 'cell_embedding',
+            'cell_topic': 'cell_topic', 
+            'topic_gene': 'topic_gene',
+            'gene_embedding': 'gene_embedding',
+            'topic_embedding': 'topic_embedding'
+        }
+        
+        # 检查目录名
+        for dir_name in parent_dirs:
+            if dir_name in dir_type_mapping:
+                return dir_type_mapping[dir_name]
+        
+        # 如果目录识别失败，回退到文件名识别
+        file_name = path_obj.stem.lower()
+        
+        # 按照优先级顺序检查文件名中的关键词
+        priority_order = [
+            ('cell_topic', ['cell_topic']),
+            ('topic_gene', ['topic_gene']),
+            ('gene_embedding', ['gene_embedding', 'gene_emb']),
+            ('topic_embedding', ['topic_embedding', 'topic_emb']),
+            ('cell_embedding', ['cell_embedding'])
+        ]
+        
+        for result_type, keywords in priority_order:
+            for keyword in keywords:
+                if keyword in file_name:
+                    return result_type
+        
+        return 'unknown'
+    
+    def preprocess_adata(self, adata_path: str, verbose: bool = True):
         """
-        加载保存的矩阵文件
+        加载并预处理adata数据（与train_fastopic.py保持一致）
         
         Args:
-            dataset_name: 数据集名称
-            n_topics: 主题数量
-            results_dir: 结果目录
+            adata_path: 单细胞数据路径
+            verbose: 是否详细输出
             
         Returns:
-            matrices: 矩阵字典
+            adata: 预处理后的adata对象
         """
-        results_path = Path(results_dir)
-        matrices = {}
+        if verbose:
+            print(f"📁 加载adata: {adata_path}")
         
-        # 需要加载的矩阵类型
-        matrix_types = ['cell_embedding', 'cell_topic', 'topic_gene', 
-                       'gene_embedding', 'topic_embedding']
+        # 加载数据
+        adata = sc.read_h5ad(adata_path)
         
-        for matrix_type in matrix_types:
-            file_name = f"{dataset_name}_{matrix_type}_{n_topics}.pkl"
-            file_path = results_path / file_name
+        if verbose:
+            print(f"原始数据维度: {adata.shape}")
+        
+        # 保存cell type信息（在预处理前）
+        cell_type_backup = None
+        if 'cell_type' in adata.obs.columns:
+            cell_type_backup = adata.obs['cell_type'].copy()
+            if verbose:
+                print(f"✅ 发现cell_type信息: {len(cell_type_backup.unique())} 个类型")
+                print(f"   类型: {list(cell_type_backup.unique())}")
+        
+        # 简单过滤（与train_fastopic.py保持一致）
+        # 过滤低质量细胞 (表达基因数 < 200)
+        sc.pp.filter_cells(adata, min_genes=200)
+        
+        # 过滤低表达基因 (在 < 3个细胞中表达)
+        sc.pp.filter_genes(adata, min_cells=3)
+        
+        if verbose:
+            print(f"过滤后数据维度: {adata.shape}")
+        
+        # 恢复cell type信息（确保与过滤后的细胞对应）
+        if cell_type_backup is not None:
+            # 获取过滤后保留的细胞索引
+            remaining_cells = adata.obs.index
+            adata.obs['cell_type'] = cell_type_backup.loc[remaining_cells]
+            if verbose:
+                print(f"✅ 恢复cell_type信息: {len(adata.obs['cell_type'].unique())} 个类型")
+        
+        # 标准化到每个细胞总计数为1
+        sc.pp.normalize_total(adata, target_sum=1)
+        
+        # log1p变换
+        sc.pp.log1p(adata)
+        
+        if verbose:
+            print(f"✅ 预处理完成: {adata.shape[0]} 个细胞, {adata.shape[1]} 个基因")
+        
+        return adata
+    
+    def load_adata(self):
+        """加载并预处理adata数据"""
+        try:
+            self.adata = self.preprocess_adata(self.adata_path, verbose=True)
             
-            if file_path.exists():
-                with open(file_path, 'rb') as f:
-                    data = pickle.load(f)
-                    matrices[matrix_type.replace('_', '_')] = data['matrix']
-                print(f"✅ Loaded {matrix_type}: {data['shape']}")
+            # 检查是否有cell type信息
+            if 'cell_type' in self.adata.obs.columns:
+                print(f"✅ Cell type信息可用于染色")
             else:
-                print(f"⚠️ Matrix file not found: {file_path}")
-        
-        return matrices
+                print("⚠️ 未发现cell_type列，请检查adata.obs中的列名")
+                print(f"   可用的obs列: {list(self.adata.obs.columns)}")
+                
+        except Exception as e:
+            print(f"❌ 加载adata失败: {e}")
+            self.adata = None
     
-    def create_umap_plot(self,
-                        cell_topic_matrix: np.ndarray,
-                        cell_info: Optional[pd.DataFrame] = None,
-                        dataset_name: str = "Dataset",
-                        n_topics: int = 20,
-                        save: bool = True) -> str:
-        """
-        创建UMAP可视化
+    def load_data(self, file_path: str) -> Any:
+        """加载pickle数据"""
+        try:
+            with open(file_path, 'rb') as f:
+                data = pickle.load(f)
+            print(f"✅ 成功加载: {file_path}")
+            print(f"   数据类型: {type(data)}")
+            if hasattr(data, 'shape'):
+                print(f"   数据形状: {data.shape}")
+            return data
+        except Exception as e:
+            print(f"❌ 加载失败: {file_path}, 错误: {e}")
+            return None
+    
+    def load_result(self, file_path: str) -> Dict[str, Any]:
+        """加载结果数据"""
+        result_type = self.identify_result_type(file_path)
+        data = self.load_data(file_path)
         
-        Args:
-            cell_topic_matrix: Cell-topic矩阵
-            cell_info: 细胞信息
-            dataset_name: 数据集名称
-            n_topics: 主题数量
-            save: 是否保存图片
+        if data is None:
+            return None
+        
+        return {
+            'type': result_type,
+            'data': data,
+            'file_path': file_path
+        }
+    
+    def load_results(self, file_paths: List[str]) -> List[Dict[str, Any]]:
+        """批量加载多个文件"""
+        results = []
+        
+        for file_path in file_paths:
+            if os.path.exists(file_path):
+                print(f"📁 加载文件: {file_path}")
+                result = self.load_result(file_path)
+                if result:
+                    print(f"   类型: {result['type']}")
+                    results.append(result)
+            else:
+                print(f"❌ 文件不存在: {file_path}")
+        
+        return results
+    
+    def visualize_results(self, results: List[Dict[str, Any]]):
+        """可视化结果（占位符，待实现具体绘图逻辑）"""
+        print(f"\n🎨 可视化 {len(results)} 个结果文件")
+        
+        for result in results:
+            result_type = result['type']
+            data = result['data']
+            file_path = result['file_path']
             
-        Returns:
-            output_path: 输出文件路径
-        """
-        print("🎨 Creating UMAP visualization...")
-        
-        # UMAP降维
-        reducer = umap.UMAP(
-            n_components=2,
-            n_neighbors=15,
-            min_dist=0.1,
-            metric='euclidean',
-            random_state=42,
-            verbose=False
-        )
-        
-        embedding = reducer.fit_transform(cell_topic_matrix)
-        
-        # 创建图表
-        fig, axes = plt.subplots(1, 2, figsize=(16, 6))
-        
-        # 如果没有提供细胞信息，创建基于主题的信息
-        if cell_info is None:
-            n_cells = cell_topic_matrix.shape[0]
-            main_topics = np.argmax(cell_topic_matrix, axis=1)
+            print(f"\n📊 {result_type}: {file_path}")
+            print(f"   数据形状: {data.shape if hasattr(data, 'shape') else 'N/A'}")
             
-            cell_info = pd.DataFrame({
-                'cell_type': [f'Topic_{t%8}' for t in main_topics],  # 简化为8种类型
-                'batch': ['0'] * n_cells
-            })
+            # 实现具体的绘图逻辑
+            if result_type == 'cell_embedding':
+                self.plot_cell_embedding_umap(data, file_path)
+            elif result_type == 'cell_topic':
+                self.plot_cell_topic_umap(data, file_path)
+            elif result_type == 'gene_embedding':
+                # self.plot_gene_embeddings(data, file_path)
+                pass
+            elif result_type == 'topic_embedding':
+                self.plot_topic_embedding_umap(data, file_path)
+            elif result_type == 'topic_gene':
+                # self.plot_topic_gene_matrix(data, file_path)
+                pass
+    
+    def plot_cell_topic_umap(self, cell_topic_matrix: np.ndarray, file_path: str):
+        """绘制cell topic的UMAP降维图，根据cell type染色"""
+        print(f"\n🎨 绘制Cell Topic UMAP图: {file_path}")
         
-        # 左图：按细胞类型着色
-        ax1 = axes[0]
-        unique_types = cell_info['cell_type'].unique()
+        # 检查数据维度
+        n_cells, n_topics = cell_topic_matrix.shape
+        print(f"   细胞数量: {n_cells}, 主题数量: {n_topics}")
         
-        for cell_type in unique_types:
-            mask = cell_info['cell_type'] == cell_type
-            ax1.scatter(embedding[mask, 0], embedding[mask, 1],
-                       label=cell_type, alpha=0.6, s=10)
+        # 检查是否有adata和cell type信息
+        if self.adata is None:
+            print("⚠️ 未提供adata路径，将使用默认颜色")
+            cell_types = None
+        elif 'cell_type' not in self.adata.obs.columns:
+            print("⚠️ adata中无cell_type信息，将使用默认颜色")
+            cell_types = None
+        else:
+            cell_types = self.adata.obs['cell_type'].values
+            # 检查细胞数量是否匹配
+            if len(cell_types) != n_cells:
+                print(f"⚠️ 细胞数量不匹配: cell_topic({n_cells}) vs adata({len(cell_types)})")
+                cell_types = None
         
-        ax1.set_xlabel('UMAP1')
-        ax1.set_ylabel('UMAP2')
-        ax1.set_title(f'UMAP - Cell Types ({dataset_name}-{n_topics})')
-        ax1.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=8)
-        ax1.grid(True, alpha=0.3)
+        # 使用UMAP进行降维
+        print("🔄 执行UMAP降维...")
+        reducer = umap.UMAP(n_components=2, random_state=42, n_neighbors=15, min_dist=0.1)
+        umap_coords = reducer.fit_transform(cell_topic_matrix)
         
-        # 右图：按批次着色
-        ax2 = axes[1]
-        unique_batches = cell_info['batch'].unique()
-        colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728']
+        # 创建图形
+        plt.figure(figsize=(12, 8))
         
-        for i, batch in enumerate(sorted(unique_batches)):
-            mask = cell_info['batch'] == batch
-            color = colors[i % len(colors)]
-            ax2.scatter(embedding[mask, 0], embedding[mask, 1],
-                       label=f'Batch {batch}', alpha=0.6, s=10, color=color)
+        if cell_types is not None:
+            # 根据cell type染色
+            unique_types = np.unique(cell_types)
+            colors = plt.cm.tab20(np.linspace(0, 1, len(unique_types)))
+            
+            for i, cell_type in enumerate(unique_types):
+                mask = cell_types == cell_type
+                plt.scatter(umap_coords[mask, 0], umap_coords[mask, 1], 
+                           c=[colors[i]], label=cell_type, alpha=0.7, s=20)
+            
+            plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=10)
+            title = f"Cell Topic UMAP (colored by cell type)\n{n_cells} cells, {n_topics} topics"
+        else:
+            # 使用默认颜色
+            plt.scatter(umap_coords[:, 0], umap_coords[:, 1], 
+                       c='skyblue', alpha=0.7, s=20)
+            title = f"Cell Topic UMAP\n{n_cells} cells, {n_topics} topics"
         
-        ax2.set_xlabel('UMAP1')
-        ax2.set_ylabel('UMAP2')
-        ax2.set_title(f'UMAP - Batches ({dataset_name}-{n_topics})')
-        ax2.legend()
-        ax2.grid(True, alpha=0.3)
-        
-        plt.tight_layout()
+        plt.title(title, fontsize=14, pad=20)
+        plt.xlabel('UMAP 1', fontsize=12)
+        plt.ylabel('UMAP 2', fontsize=12)
+        plt.grid(True, alpha=0.3)
         
         # 保存图片
-        if save:
-            output_path = self.output_dir / f"{dataset_name}_umap_{n_topics}.png"
-            plt.savefig(output_path, dpi=300, bbox_inches='tight')
-            print(f"✅ UMAP saved: {output_path}")
-        else:
-            output_path = None
-        
-        plt.show()
-        return str(output_path) if output_path else ""
-    
-    def create_topic_analysis(self,
-                             cell_topic_matrix: np.ndarray,
-                             topic_gene_matrix: Optional[np.ndarray] = None,
-                             dataset_name: str = "Dataset",
-                             n_topics: int = 20,
-                             save: bool = True) -> str:
-        """
-        创建主题分析图表
-        
-        Args:
-            cell_topic_matrix: Cell-topic矩阵
-            topic_gene_matrix: Topic-gene矩阵
-            dataset_name: 数据集名称
-            n_topics: 主题数量
-            save: 是否保存
-            
-        Returns:
-            output_path: 输出路径
-        """
-        print("📊 Creating topic analysis...")
-        
-        # 计算topic统计
-        topic_sums = cell_topic_matrix.sum(axis=0)
-        topic_percentages = (topic_sums / topic_sums.sum()) * 100
-        
-        # Shannon entropy
-        probs = topic_percentages / 100
-        shannon_entropy = -np.sum(probs * np.log(probs + 1e-10))
-        effective_topics = np.exp(shannon_entropy)
-        
-        # 创建图表
-        if topic_gene_matrix is not None:
-            fig, axes = plt.subplots(2, 2, figsize=(15, 12))
-        else:
-            fig, axes = plt.subplots(1, 2, figsize=(15, 6))
-            axes = [axes]
-        
-        # Topic分布柱状图
-        ax1 = axes[0] if len(axes) > 1 else axes[0][0]
-        bars = ax1.bar(range(n_topics), topic_percentages, alpha=0.7, 
-                      color=plt.cm.Set3(np.linspace(0, 1, n_topics)))
-        ax1.set_title(f'Topic Distribution ({dataset_name}-{n_topics})', 
-                     fontsize=14, fontweight='bold')
-        ax1.set_xlabel('Topic ID')
-        ax1.set_ylabel('Percentage (%)')
-        ax1.grid(True, alpha=0.3)
-        
-        # 添加数值标签
-        for i, (bar, pct) in enumerate(zip(bars, topic_percentages)):
-            if pct > 2:  # 只标注大于2%的
-                ax1.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.1,
-                        f'{pct:.1f}%', ha='center', va='bottom', fontsize=8)
-        
-        # 质量指标文本
-        ax2 = axes[1] if len(axes) > 1 else axes[0][1]
-        ax2.axis('off')
-        
-        metrics_text = f"""Topic Quality Metrics
-
-Shannon Entropy: {shannon_entropy:.3f}
-Effective Topics: {effective_topics:.1f} / {n_topics}
-Max Topic %: {np.max(topic_percentages):.1f}%
-Min Topic %: {np.min(topic_percentages):.1f}%
-
-Quality Assessment:
-{'✅ High Diversity' if shannon_entropy > 2.5 else '⚠️ Low Diversity'}
-{'✅ Balanced Distribution' if np.max(topic_percentages) < 20 else '⚠️ Imbalanced'}
-{'✅ All Topics Active' if np.min(topic_percentages) > 1 else '⚠️ Inactive Topics'}
-
-Dataset: {dataset_name}
-Topics: {n_topics}
-Cells: {cell_topic_matrix.shape[0]:,}
-"""
-        
-        ax2.text(0.05, 0.95, metrics_text, transform=ax2.transAxes,
-                fontfamily='monospace', fontsize=11, verticalalignment='top',
-                bbox=dict(boxstyle="round,pad=0.5", facecolor="lightblue", alpha=0.8))
-        
-        # 如果有topic-gene矩阵，添加更多分析
-        if topic_gene_matrix is not None and len(axes) > 1:
-            # Cell-topic热力图（采样）
-            ax3 = axes[1][0]
-            sample_size = min(1000, cell_topic_matrix.shape[0])
-            sample_indices = np.random.choice(cell_topic_matrix.shape[0], 
-                                            sample_size, replace=False)
-            sample_matrix = cell_topic_matrix[sample_indices]
-            
-            im = ax3.imshow(sample_matrix.T, aspect='auto', cmap='Blues', 
-                           vmin=0, vmax=1)
-            ax3.set_title(f'Cell-Topic Weights ({sample_size} cells)', 
-                         fontsize=12, fontweight='bold')
-            ax3.set_xlabel('Cells (sampled)')
-            ax3.set_ylabel('Topics')
-            plt.colorbar(im, ax=ax3, shrink=0.8)
-            
-            # Topic相似性
-            ax4 = axes[1][1]
-            from sklearn.metrics.pairwise import cosine_similarity
-            topic_similarity = cosine_similarity(topic_gene_matrix)
-            
-            im2 = ax4.imshow(topic_similarity, cmap='RdBu_r', vmin=-1, vmax=1)
-            ax4.set_title('Topic Similarity (Gene-based)', fontsize=12, fontweight='bold')
-            ax4.set_xlabel('Topics')
-            ax4.set_ylabel('Topics')
-            plt.colorbar(im2, ax=ax4, shrink=0.8)
-        
+        file_stem = Path(file_path).stem
+        output_file = self.output_dir / f"{file_stem}_umap.png"
         plt.tight_layout()
+        plt.savefig(output_file, dpi=300, bbox_inches='tight')
+        plt.show()
+        
+        print(f"✅ UMAP图已保存: {output_file}")
+        
+        return umap_coords
+    
+    def plot_cell_embedding_umap(self, cell_embeddings: np.ndarray, file_path: str):
+        """绘制cell embedding的UMAP降维图，根据cell type染色"""
+        print(f"\n🎨 绘制Cell Embedding UMAP图: {file_path}")
+        
+        # 检查数据维度
+        n_cells, embedding_dim = cell_embeddings.shape
+        print(f"   细胞数量: {n_cells}, Embedding维度: {embedding_dim}")
+        
+        # 检查是否有adata和cell type信息
+        if self.adata is None:
+            print("⚠️ 未提供adata路径，将使用默认颜色")
+            cell_types = None
+        elif 'cell_type' not in self.adata.obs.columns:
+            print("⚠️ adata中无cell_type信息，将使用默认颜色")
+            cell_types = None
+        else:
+            cell_types = self.adata.obs['cell_type'].values
+            # 检查细胞数量是否匹配
+            if len(cell_types) != n_cells:
+                print(f"⚠️ 细胞数量不匹配: cell_embedding({n_cells}) vs adata({len(cell_types)})")
+                cell_types = None
+        
+        # 使用UMAP进行降维
+        print("🔄 执行UMAP降维...")
+        reducer = umap.UMAP(n_components=2, random_state=42, n_neighbors=15, min_dist=0.1)
+        umap_coords = reducer.fit_transform(cell_embeddings)
+        
+        # 创建图形
+        plt.figure(figsize=(12, 8))
+        
+        if cell_types is not None:
+            # 根据cell type染色
+            unique_types = np.unique(cell_types)
+            colors = plt.cm.tab20(np.linspace(0, 1, len(unique_types)))
+            
+            for i, cell_type in enumerate(unique_types):
+                mask = cell_types == cell_type
+                plt.scatter(umap_coords[mask, 0], umap_coords[mask, 1], 
+                           c=[colors[i]], label=cell_type, alpha=0.7, s=20)
+            
+            plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=10)
+            title = f"Cell Embedding UMAP (colored by cell type)\n{n_cells} cells, {embedding_dim}D embeddings"
+        else:
+            # 使用默认颜色
+            plt.scatter(umap_coords[:, 0], umap_coords[:, 1], 
+                       c='skyblue', alpha=0.7, s=20)
+            title = f"Cell Embedding UMAP\n{n_cells} cells, {embedding_dim}D embeddings"
+        
+        plt.title(title, fontsize=14, pad=20)
+        plt.xlabel('UMAP 1', fontsize=12)
+        plt.ylabel('UMAP 2', fontsize=12)
+        plt.grid(True, alpha=0.3)
         
         # 保存图片
-        if save:
-            output_path = self.output_dir / f"{dataset_name}_topic_analysis_{n_topics}.png"
-            plt.savefig(output_path, dpi=300, bbox_inches='tight')
-            print(f"✅ Topic analysis saved: {output_path}")
-        else:
-            output_path = None
-        
-        plt.show()
-        return str(output_path) if output_path else ""
-    
-    def create_comparison_plot(self,
-                              results_dict: Dict[str, Dict],
-                              dataset_name: str = "Dataset",
-                              save: bool = True) -> str:
-        """
-        创建多个配置的对比图
-        
-        Args:
-            results_dict: {config_name: {metrics...}} 格式的结果
-            dataset_name: 数据集名称
-            save: 是否保存
-            
-        Returns:
-            output_path: 输出路径
-        """
-        print("⚖️ Creating comparison plot...")
-        
-        config_names = list(results_dict.keys())
-        
-        # 提取指标
-        shannon_entropies = [results_dict[name]['shannon_entropy'] for name in config_names]
-        effective_topics = [results_dict[name]['effective_topics'] for name in config_names]
-        max_topic_pcts = [np.max(results_dict[name]['topic_percentages']) for name in config_names]
-        
-        # 创建对比图
-        fig, axes = plt.subplots(1, 3, figsize=(18, 6))
-        
-        # Shannon Entropy对比
-        axes[0].bar(config_names, shannon_entropies, alpha=0.7, color='skyblue')
-        axes[0].set_title('Shannon Entropy Comparison', fontweight='bold')
-        axes[0].set_ylabel('Shannon Entropy')
-        axes[0].grid(True, alpha=0.3)
-        axes[0].tick_params(axis='x', rotation=45)
-        
-        # Effective Topics对比
-        axes[1].bar(config_names, effective_topics, alpha=0.7, color='lightgreen')
-        axes[1].set_title('Effective Topics Comparison', fontweight='bold')
-        axes[1].set_ylabel('Effective Topics')
-        axes[1].grid(True, alpha=0.3)
-        axes[1].tick_params(axis='x', rotation=45)
-        
-        # Max Topic %对比
-        axes[2].bar(config_names, max_topic_pcts, alpha=0.7, color='salmon')
-        axes[2].set_title('Max Topic % Comparison', fontweight='bold')
-        axes[2].set_ylabel('Max Topic %')
-        axes[2].grid(True, alpha=0.3)
-        axes[2].tick_params(axis='x', rotation=45)
-        
+        file_stem = Path(file_path).stem
+        output_file = self.output_dir / f"{file_stem}_umap.png"
         plt.tight_layout()
-        
-        if save:
-            output_path = self.output_dir / f"{dataset_name}_comparison.png"
-            plt.savefig(output_path, dpi=300, bbox_inches='tight')
-            print(f"✅ Comparison saved: {output_path}")
-        else:
-            output_path = None
-        
+        plt.savefig(output_file, dpi=300, bbox_inches='tight')
         plt.show()
-        return str(output_path) if output_path else ""
+        
+        print(f"✅ UMAP图已保存: {output_file}")
+        
+        return umap_coords
     
-    def visualize_from_files(self,
-                           dataset_name: str,
-                           n_topics: int,
-                           cell_info: Optional[pd.DataFrame] = None,
-                           results_dir: str = "results") -> List[str]:
-        """
-        从保存的文件创建所有可视化
+    def plot_topic_embedding_umap(self, topic_embeddings: np.ndarray, file_path: str):
+        """绘制topic embedding的UMAP降维图，根据topic ID染色"""
+        print(f"\n🎨 绘制Topic Embedding UMAP图: {file_path}")
         
-        Args:
-            dataset_name: 数据集名称
-            n_topics: 主题数量
-            cell_info: 细胞信息
-            results_dir: 结果目录
+        # 检查数据维度
+        n_topics, embedding_dim = topic_embeddings.shape
+        print(f"   主题数量: {n_topics}, Embedding维度: {embedding_dim}")
+        
+        # 使用UMAP进行降维
+        print("🔄 执行UMAP降维...")
+        reducer = umap.UMAP(n_components=2, random_state=42, n_neighbors=min(15, n_topics-1), min_dist=0.1)
+        umap_coords = reducer.fit_transform(topic_embeddings)
+        
+        # 创建图形
+        plt.figure(figsize=(12, 8))
+        
+        # 根据topic ID染色
+        topic_ids = np.arange(n_topics)
+        colors = plt.cm.tab20(np.linspace(0, 1, min(20, n_topics)))
+        
+        # 如果主题数量超过20个，使用连续颜色映射
+        if n_topics > 20:
+            colors = plt.cm.viridis(np.linspace(0, 1, n_topics))
+            scatter = plt.scatter(umap_coords[:, 0], umap_coords[:, 1], 
+                                c=topic_ids, cmap='viridis', alpha=0.8, s=80)
+            plt.colorbar(scatter, label='Topic ID')
+        else:
+            # 对于20个以下的主题，使用离散颜色并添加图例
+            for i in range(n_topics):
+                plt.scatter(umap_coords[i, 0], umap_coords[i, 1], 
+                           c=[colors[i]], label=f'Topic {i}', alpha=0.8, s=80)
             
-        Returns:
-            output_files: 生成的文件列表
-        """
-        print(f"🎨 Creating visualizations for {dataset_name} ({n_topics} topics)")
+            # 只有在主题数量不太多时才显示图例
+            if n_topics <= 12:
+                plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=10)
         
-        # 加载矩阵
-        matrices = self.load_matrices(dataset_name, n_topics, results_dir)
+        # 添加topic ID标注
+        for i in range(n_topics):
+            plt.annotate(f'T{i}', (umap_coords[i, 0], umap_coords[i, 1]), 
+                        xytext=(5, 5), textcoords='offset points', 
+                        fontsize=9, alpha=0.7)
         
-        if 'cell_topic' not in matrices:
-            print("❌ Cell-topic matrix not found!")
-            return []
+        title = f"Topic Embedding UMAP\n{n_topics} topics, {embedding_dim}D embeddings"
+        plt.title(title, fontsize=14, pad=20)
+        plt.xlabel('UMAP 1', fontsize=12)
+        plt.ylabel('UMAP 2', fontsize=12)
+        plt.grid(True, alpha=0.3)
         
-        output_files = []
+        # 保存图片
+        file_stem = Path(file_path).stem
+        output_file = self.output_dir / f"{file_stem}_umap.png"
+        plt.tight_layout()
+        plt.savefig(output_file, dpi=300, bbox_inches='tight')
+        plt.show()
         
-        # UMAP可视化
-        umap_file = self.create_umap_plot(
-            matrices['cell_topic'],
-            cell_info,
-            dataset_name,
-            n_topics
-        )
-        if umap_file:
-            output_files.append(umap_file)
+        print(f"✅ UMAP图已保存: {output_file}")
         
-        # 主题分析
-        topic_gene_matrix = matrices.get('topic_gene', None)
-        analysis_file = self.create_topic_analysis(
-            matrices['cell_topic'],
-            topic_gene_matrix,
-            dataset_name,
-            n_topics
-        )
-        if analysis_file:
-            output_files.append(analysis_file)
-        
-        print(f"✅ Generated {len(output_files)} visualization files")
-        return output_files
+        return umap_coords
 
 def main():
-    """测试函数"""
-    # 示例：为20-topic结果创建可视化
-    visualizer = ScFastopicVisualizer("visualization")
+    parser = argparse.ArgumentParser(description="scFASTopic结果可视化")
+    parser.add_argument("files", nargs="+", help="结果文件路径")
+    parser.add_argument("--output_dir", default="visualization", help="输出目录")
+    parser.add_argument("--adata_path", help="adata文件路径，用于获取cell type信息")
+    parser.add_argument("--no_plot", action="store_true", help="只加载数据不绘图")
     
-    # 从文件创建可视化
-    output_files = visualizer.visualize_from_files(
-        dataset_name="PBMC",
-        n_topics=20,
-        results_dir="results"
-    )
+    args = parser.parse_args()
     
-    print(f"Generated files: {output_files}")
+    # 创建可视化器
+    visualizer = ResultVisualizer(output_dir=args.output_dir, adata_path=args.adata_path)
+    
+    # 批量加载结果
+    results = visualizer.load_results(args.files)
+    
+    if not results:
+        print("❌ 没有成功加载的文件")
+        return
+    
+    # 输出加载总结
+    print(f"\n{'='*60}")
+    print("加载总结")
+    print(f"{'='*60}")
+    
+    type_counts = {}
+    for result in results:
+        result_type = result['type']
+        type_counts[result_type] = type_counts.get(result_type, 0) + 1
+    
+    for result_type, count in type_counts.items():
+        print(f"📊 {result_type}: {count} 个文件")
+    
+    # 可视化（如果需要）
+    if not args.no_plot:
+        visualizer.visualize_results(results)
 
 if __name__ == "__main__":
     main()

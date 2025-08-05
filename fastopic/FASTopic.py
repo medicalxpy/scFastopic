@@ -158,7 +158,7 @@ class FASTopic:
         doc_embed_size = dataset.cell_embed_size
 
         if not _fitted:
-            self.model.init(vocab_size, doc_embed_size)
+            self.model.init(vocab_size, doc_embed_size, cell_embeddings=cell_embeddings)
         else:
             pre_vocab = self.vocab
             self.model.init(
@@ -166,7 +166,8 @@ class FASTopic:
                 doc_embed_size,
                 _fitted,
                 pre_vocab,
-                dataset.vocab
+                dataset.vocab,
+                cell_embeddings
             )
 
         self.vocab = dataset.vocab
@@ -195,9 +196,20 @@ class FASTopic:
                     loss_rst_dict[key] += rst_dict[key] * batch_bow.shape[0]
 
             if epoch % self.log_interval == 0:
-                output_log = f"Epoch: {epoch:03d}"
-                for key in loss_rst_dict:
-                    output_log += f" {key}: {loss_rst_dict[key] / data_size :.3f}"
+                # 计算平均损失
+                avg_losses = {key: loss_rst_dict[key] / data_size for key in loss_rst_dict}
+                
+                # 构建详细的loss展示
+                if 'loss_ETP' in avg_losses and 'loss_DSR' in avg_losses:
+                    output_log = f"Epoch: {epoch:03d} | Total: {avg_losses['loss']:.3f} = ETP: {avg_losses['loss_ETP']:.3f} + DSR: {avg_losses['loss_DSR']:.3f}"
+                    if 'loss_DT' in avg_losses and 'loss_TW' in avg_losses:
+                        output_log += f" | ETP = DT: {avg_losses['loss_DT']:.3f} + TW: {avg_losses['loss_TW']:.3f}"
+                else:
+                    # 兼容旧版本格式
+                    output_log = f"Epoch: {epoch:03d}"
+                    for key in loss_rst_dict:
+                        output_log += f" {key}: {avg_losses[key]:.3f}"
+                
                 logger.info(output_log)
 
         self.beta = self.get_beta()
@@ -300,9 +312,20 @@ class FASTopic:
                     loss_rst_dict[key] += rst_dict[key] * batch_bow.shape[0]
 
             if epoch % self.log_interval == 0:
-                output_log = f"Epoch: {epoch:03d}"
-                for key in loss_rst_dict:
-                    output_log += f" {key}: {loss_rst_dict[key] / data_size :.3f}"
+                # 计算平均损失
+                avg_losses = {key: loss_rst_dict[key] / data_size for key in loss_rst_dict}
+                
+                # 构建详细的loss展示
+                if 'loss_ETP' in avg_losses and 'loss_DSR' in avg_losses:
+                    output_log = f"Epoch: {epoch:03d} | Total: {avg_losses['loss']:.3f} = ETP: {avg_losses['loss_ETP']:.3f} + DSR: {avg_losses['loss_DSR']:.3f}"
+                    if 'loss_DT' in avg_losses and 'loss_TW' in avg_losses:
+                        output_log += f" | ETP = DT: {avg_losses['loss_DT']:.3f} + TW: {avg_losses['loss_TW']:.3f}"
+                else:
+                    # 兼容旧版本格式
+                    output_log = f"Epoch: {epoch:03d}"
+                    for key in loss_rst_dict:
+                        output_log += f" {key}: {avg_losses[key]:.3f}"
+                
                 logger.info(output_log)
 
         self.beta = self.get_beta()

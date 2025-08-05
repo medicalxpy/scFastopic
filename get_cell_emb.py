@@ -2,8 +2,11 @@
 """
 scFASTopic Cell Embedding Extraction Script
 
-使用原始Geneformer库提取cell embeddings的独立脚本
-直接调用Geneformer的TranscriptomeTokenizer和EmbExtractor
+支持多种embedding方法：
+1. Geneformer - 使用预训练的Geneformer模型
+2. GenePT - 使用GenePT预训练基因embedding (策略1: 加权平均)
+3. GenePT - 使用GenePT预训练基因embedding (策略2: 句子embedding)
+4. PCA - 备选方案
 """
 
 import os
@@ -18,12 +21,28 @@ from typing import List, Dict, Any, Optional, Tuple
 import numpy as np
 import scanpy as sc
 import anndata as ad
+import pandas as pd
+import warnings
+warnings.filterwarnings('ignore')
 
 # 添加Geneformer路径到系统路径
-sys.path.insert(0, '/root/autodl-tmp/Geneformer')
+sys.path.insert(0, '/root/autodl-tmp/scFastopic/Geneformer')
 
-# 导入Geneformer原始组件
-from geneformer import TranscriptomeTokenizer, EmbExtractor
+# 导入Geneformer原始组件 (可选)
+try:
+    from geneformer import TranscriptomeTokenizer, EmbExtractor
+    GENEFORMER_AVAILABLE = True
+except ImportError:
+    GENEFORMER_AVAILABLE = False
+    print("⚠️ Geneformer not available, only GenePT and PCA methods will work")
+
+# 导入Sentence Transformers (可选)
+try:
+    from sentence_transformers import SentenceTransformer
+    SENTENCE_TRANSFORMERS_AVAILABLE = True
+except ImportError:
+    SENTENCE_TRANSFORMERS_AVAILABLE = False
+    print("⚠️ Sentence Transformers not available, GenePT strategy2 will use simplified version")
 
 # 设置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -34,11 +53,13 @@ class EmbeddingConfig:
     def __init__(self, 
                  input_data: str,
                  dataset_name: str = "dataset",
-                 output_dir: str = "results",
+                 output_dir: str = "results/cell_embedding",
+                 embedding_type: str = "geneformer",
+                 genept_strategy: str = "strategy1",
                  max_cells: Optional[int] = None,
                  n_top_genes: Optional[int] = None,
-                 use_geneformer: bool = True,
                  model_path: Optional[str] = None,
+                 genept_path: Optional[str] = None,
                  emb_layer: int = -1,
                  forward_batch_size: int = 100,
                  nproc: int = 4,
@@ -47,10 +68,12 @@ class EmbeddingConfig:
         self.input_data = input_data
         self.dataset_name = dataset_name
         self.output_dir = output_dir
+        self.embedding_type = embedding_type  # "geneformer", "genept", "pca"
+        self.genept_strategy = genept_strategy  # "strategy1", "strategy2"
         self.max_cells = max_cells
         self.n_top_genes = n_top_genes
-        self.use_geneformer = use_geneformer
         self.model_path = model_path
+        self.genept_path = genept_path or '/root/autodl-tmp/scFastopic/GenePT_emebdding_v2/GenePT_gene_protein_embedding_model_3_text.pickle'
         self.emb_layer = emb_layer
         self.forward_batch_size = forward_batch_size
         self.nproc = nproc
@@ -190,7 +213,7 @@ def extract_geneformer_embeddings(adata: ad.AnnData,
         )
         
         # 提取embeddings
-        model_path = config.model_path or "/root/autodl-tmp/Geneformer/models/geneformer-v2"
+        model_path = config.model_path or "/root/autodl-tmp/scFastopic/Geneformer/Geneformer-V2-316M"
         
         embs_df = embex.extract_embs(
             model_directory=model_path,
@@ -245,81 +268,277 @@ def extract_pca_embeddings(adata: ad.AnnData,
     
     return embeddings.astype(np.float32)
 
+def load_genept_embeddings(genept_path: str, verbose: bool = False) -> Dict[str, np.ndarray]:
+    """加载GenePT基因embedding"""
+    if verbose:
+        logger.info(f"加载GenePT embedding: {genept_path}")
+    
+    with open(genept_path, 'rb') as f:
+        genept_data = pickle.load(f)
+    
+    if verbose:
+        logger.info(f"成功加载 {len(genept_data)} 个基因的embedding")
+    
+    return genept_data
+
+def extract_genept_strategy1(adata: ad.AnnData, 
+                            genept_embeddings: Dict[str, np.ndarray], 
+                            verbose: bool = False) -> np.ndarray:
+    """
+    GenePT策略1: 基于表达水平加权平均基因embedding
+    """
+    if verbose:
+        logger.info("执行GenePT策略1: 基于表达水平加权平均基因embedding")
+    
+    # 获取基因symbols，优先使用gene_symbols列，否则使用var_names
+    if 'gene_symbols' in adata.var.columns:
+        gene_symbols = adata.var['gene_symbols'].tolist()
+        if verbose:
+            logger.info("使用adata.var['gene_symbols']进行GenePT匹配")
+    else:
+        gene_symbols = adata.var_names.tolist()
+        if verbose:
+            logger.info("使用adata.var_names进行GenePT匹配")
+    
+    # 找到在GenePT中存在的基因
+    available_genes = [gene for gene in gene_symbols if gene in genept_embeddings]
+    
+    if verbose:
+        logger.info(f"总基因数: {len(gene_symbols)}")
+        logger.info(f"在GenePT中找到的基因: {len(available_genes)}")
+    
+    if len(available_genes) == 0:
+        raise ValueError("没有找到任何在GenePT中存在的基因")
+    
+    # 获取表达矩阵 (cells x genes)
+    if hasattr(adata.X, 'toarray'):
+        X = adata.X.toarray()
+    else:
+        X = adata.X
+    
+    # 构建可用基因的索引 - 基于gene_symbols匹配
+    gene_indices = [i for i, gene in enumerate(gene_symbols) if gene in genept_embeddings]
+    available_gene_symbols = [gene_symbols[i] for i in gene_indices]
+    
+    # 提取对应的表达数据
+    X_available = X[:, gene_indices]  # (n_cells, n_available_genes)
+    
+    # 获取GenePT embeddings
+    first_gene = available_gene_symbols[0]
+    embedding_dim = len(genept_embeddings[first_gene])
+    gene_embeddings = np.array([genept_embeddings[gene] for gene in available_gene_symbols])
+    
+    if verbose:
+        logger.info(f"基因embedding维度: {embedding_dim}")
+        logger.info(f"使用的基因数量: {len(available_gene_symbols)}")
+    
+    # 计算加权平均cell embedding
+    cell_embeddings = []
+    
+    for i in range(X_available.shape[0]):
+        cell_expression = X_available[i, :]
+        
+        # 避免除零错误
+        if np.sum(cell_expression) == 0:
+            cell_embedding = np.mean(gene_embeddings, axis=0)
+        else:
+            weights = cell_expression / np.sum(cell_expression)
+            cell_embedding = np.sum(gene_embeddings * weights[:, np.newaxis], axis=0)
+        
+        cell_embeddings.append(cell_embedding)
+    
+    cell_embeddings = np.array(cell_embeddings)
+    
+    if verbose:
+        logger.info(f"生成的cell embedding形状: {cell_embeddings.shape}")
+    
+    return cell_embeddings
+
+def extract_genept_strategy2(adata: ad.AnnData, 
+                            genept_embeddings: Dict[str, np.ndarray], 
+                            verbose: bool = False) -> np.ndarray:
+    """
+    GenePT策略2: 基于表达水平排序的基因名称创建句子embedding
+    """
+    if verbose:
+        logger.info("执行GenePT策略2: 基于表达水平排序创建句子embedding")
+    
+    # 获取基因symbols，优先使用gene_symbols列，否则使用var_names
+    if 'gene_symbols' in adata.var.columns:
+        gene_symbols = adata.var['gene_symbols'].tolist()
+        if verbose:
+            logger.info("使用adata.var['gene_symbols']进行GenePT匹配")
+    else:
+        gene_symbols = adata.var_names.tolist()
+        if verbose:
+            logger.info("使用adata.var_names进行GenePT匹配")
+    
+    available_genes = [gene for gene in gene_symbols if gene in genept_embeddings]
+    
+    if len(available_genes) == 0:
+        raise ValueError("没有找到任何在GenePT中存在的基因")
+    
+    # 获取表达矩阵
+    if hasattr(adata.X, 'toarray'):
+        X = adata.X.toarray()
+    else:
+        X = adata.X
+    
+    # 构建可用基因的索引 - 基于gene_symbols匹配
+    gene_indices = [i for i, gene in enumerate(gene_symbols) if gene in genept_embeddings]
+    available_gene_symbols = [gene_symbols[i] for i in gene_indices]
+    X_available = X[:, gene_indices]
+    
+    # 尝试使用sentence transformer
+    if SENTENCE_TRANSFORMERS_AVAILABLE:
+        try:
+            if verbose:
+                logger.info("加载Sentence Transformer模型...")
+            model = SentenceTransformer('all-MiniLM-L6-v2')
+            
+            # 为每个细胞创建基因句子
+            cell_sentences = []
+            top_k = min(50, len(available_gene_symbols))
+            
+            for i in range(X_available.shape[0]):
+                cell_expression = X_available[i, :]
+                sorted_indices = np.argsort(cell_expression)[::-1]
+                top_genes = [available_gene_symbols[idx] for idx in sorted_indices[:top_k] if cell_expression[idx] > 0]
+                
+                if len(top_genes) == 0:
+                    top_genes = available_gene_symbols[:10]
+                
+                gene_sentence = " ".join(top_genes)
+                cell_sentences.append(gene_sentence)
+            
+            if verbose:
+                logger.info("生成句子embedding...")
+            cell_embeddings = model.encode(cell_sentences, show_progress_bar=verbose)
+            
+            return cell_embeddings
+            
+        except Exception as e:
+            if verbose:
+                logger.warning(f"Sentence Transformer失败: {e}, 使用简化版本")
+    
+    # 简化版本：基于表达排序直接组合GenePT embedding
+    if verbose:
+        logger.info("使用简化版策略2: 基于表达排序组合GenePT embedding")
+    
+    first_gene = available_gene_symbols[0]
+    embedding_dim = len(genept_embeddings[first_gene])
+    
+    cell_embeddings = []
+    top_k = min(20, len(available_gene_symbols))
+    
+    for i in range(X_available.shape[0]):
+        cell_expression = X_available[i, :]
+        sorted_indices = np.argsort(cell_expression)[::-1]
+        top_gene_indices = sorted_indices[:top_k]
+        
+        top_embeddings = []
+        top_weights = []
+        
+        for idx in top_gene_indices:
+            if cell_expression[idx] > 0:
+                gene_symbol = available_gene_symbols[idx]
+                top_embeddings.append(genept_embeddings[gene_symbol])
+                top_weights.append(cell_expression[idx])
+        
+        if len(top_embeddings) == 0:
+            top_embeddings = [genept_embeddings[available_gene_symbols[i]] for i in range(min(10, len(available_gene_symbols)))]
+            top_weights = [1.0] * len(top_embeddings)
+        
+        top_embeddings = np.array(top_embeddings)
+        top_weights = np.array(top_weights)
+        top_weights = top_weights / np.sum(top_weights)
+        
+        cell_embedding = np.sum(top_embeddings * top_weights[:, np.newaxis], axis=0)
+        cell_embeddings.append(cell_embedding)
+    
+    cell_embeddings = np.array(cell_embeddings)
+    
+    if verbose:
+        logger.info(f"生成的cell embedding形状: {cell_embeddings.shape}")
+    
+    return cell_embeddings
+
 def extract_embeddings(adata: ad.AnnData, config: EmbeddingConfig, verbose: bool = False) -> np.ndarray:
     """主要的embedding提取函数"""
     
-    if config.use_geneformer:
+    if config.embedding_type == "geneformer":
+        if not GENEFORMER_AVAILABLE:
+            logger.warning("Geneformer不可用，回退到PCA方法")
+            return extract_pca_embeddings(adata, verbose=verbose)
+        
         try:
             return extract_geneformer_embeddings(adata, config, verbose=verbose)
         except Exception as e:
             logger.error(f"Geneformer提取失败: {e}")
+            import traceback
+            traceback.print_exc()
             logger.warning("回退到PCA方法")
             return extract_pca_embeddings(adata, verbose=verbose)
-    else:
+    
+    elif config.embedding_type == "genept":
+        try:
+            # 加载GenePT embeddings
+            genept_embeddings = load_genept_embeddings(config.genept_path, verbose=verbose)
+            
+            if config.genept_strategy == "strategy1":
+                return extract_genept_strategy1(adata, genept_embeddings, verbose=verbose)
+            elif config.genept_strategy == "strategy2":
+                return extract_genept_strategy2(adata, genept_embeddings, verbose=verbose)
+            else:
+                raise ValueError(f"未知的GenePT策略: {config.genept_strategy}")
+                
+        except Exception as e:
+            logger.error(f"GenePT提取失败: {e}")
+            logger.warning("回退到PCA方法")
+            return extract_pca_embeddings(adata, verbose=verbose)
+    
+    elif config.embedding_type == "pca":
         return extract_pca_embeddings(adata, verbose=verbose)
+    
+    else:
+        raise ValueError(f"未知的embedding类型: {config.embedding_type}")
 
 def save_results(cell_embeddings: np.ndarray, 
-                selected_genes: List[str],
-                expression_bow,  # scipy.sparse.csr_matrix
                 config: EmbeddingConfig,
-                verbose: bool = False) -> Dict[str, str]:
-    """保存结果文件"""
+                verbose: bool = False) -> str:
+    """保存cell embedding结果"""
     
-    output_files = {}
+    # 根据embedding类型生成文件名
+    if config.embedding_type == "genept":
+        filename = f"{config.dataset_name}_{config.embedding_type}_{config.genept_strategy}.pkl"
+    else:
+        filename = f"{config.dataset_name}_{config.embedding_type}.pkl"
     
     # 保存cell embeddings
-    embedding_file = os.path.join(config.output_dir, f"{config.dataset_name}_cell_embeddings.pkl")
+    embedding_file = os.path.join(config.output_dir, filename)
     with open(embedding_file, 'wb') as f:
         pickle.dump(cell_embeddings, f)
-    output_files['embeddings'] = embedding_file
-    
-    # 保存基因列表
-    genes_file = os.path.join(config.output_dir, f"{config.dataset_name}_selected_genes.pkl")
-    with open(genes_file, 'wb') as f:
-        pickle.dump(selected_genes, f)
-    output_files['genes'] = genes_file
-    
-    # 保存真实的基因表达BOW矩阵
-    bow_file = os.path.join(config.output_dir, f"{config.dataset_name}_expression_bow.pkl")
-    with open(bow_file, 'wb') as f:
-        pickle.dump(expression_bow, f)
-    output_files['expression_bow'] = bow_file
-    
-    # 保存配置信息
-    config_file = os.path.join(config.output_dir, f"{config.dataset_name}_embedding_config.json")
-    config_dict = {
-        'dataset_name': config.dataset_name,
-        'max_cells': config.max_cells,
-        'n_top_genes': config.n_top_genes,
-        'use_geneformer': config.use_geneformer,
-        'emb_layer': config.emb_layer,
-        'forward_batch_size': config.forward_batch_size,
-        'embedding_shape': cell_embeddings.shape,
-        'n_genes': len(selected_genes)
-    }
-    
-    with open(config_file, 'w') as f:
-        json.dump(config_dict, f, indent=2)
-    output_files['config'] = config_file
     
     if verbose:
-        logger.info(f"结果已保存:")
-        logger.info(f"  - Embeddings: {embedding_file}")
-        logger.info(f"  - Genes: {genes_file}")
-        logger.info(f"  - Expression BOW: {bow_file}")
-        logger.info(f"  - Config: {config_file}")
+        logger.info(f"Cell embeddings已保存到: {embedding_file}")
     
-    return output_files
+    return embedding_file
 
 def main():
     parser = argparse.ArgumentParser(description="scFASTopic Cell Embedding Extraction")
     parser.add_argument("--input_data", required=True, help="输入数据路径(.h5ad)")
     parser.add_argument("--dataset_name", default="dataset", help="数据集名称")
-    parser.add_argument("--output_dir", default="results", help="输出目录")
+    parser.add_argument("--output_dir", default="results/cell_embedding", help="输出目录")
+    parser.add_argument("--embedding_type", default="geneformer", 
+                       choices=["geneformer", "genept", "pca"], 
+                       help="Embedding方法 (geneformer/genept/pca)")
+    parser.add_argument("--genept_strategy", default="strategy1",
+                       choices=["strategy1", "strategy2"],
+                       help="GenePT策略 (strategy1: 加权平均, strategy2: 句子embedding)")
     parser.add_argument("--max_cells", type=int, help="最大细胞数量")
     parser.add_argument("--n_top_genes", type=int, help="高变基因数量，不指定则使用全部基因")
-    parser.add_argument("--use_geneformer", action="store_true", help="使用真实Geneformer模型")
     parser.add_argument("--model_path", help="Geneformer模型路径")
+    parser.add_argument("--genept_path", help="GenePT embedding文件路径")
     parser.add_argument("--emb_layer", type=int, default=-1, help="提取embedding的层")
     parser.add_argument("--forward_batch_size", type=int, default=100, help="前向传播批次大小")
     parser.add_argument("--nproc", type=int, default=4, help="进程数")
@@ -332,10 +551,12 @@ def main():
         input_data=args.input_data,
         dataset_name=args.dataset_name,
         output_dir=args.output_dir,
+        embedding_type=args.embedding_type,
+        genept_strategy=args.genept_strategy,
         max_cells=args.max_cells,
         n_top_genes=args.n_top_genes,
-        use_geneformer=args.use_geneformer,
         model_path=args.model_path,
+        genept_path=args.genept_path,
         emb_layer=args.emb_layer,
         forward_batch_size=args.forward_batch_size,
         nproc=args.nproc,
@@ -362,7 +583,7 @@ def main():
         
         # 提取embeddings
         if config.verbose:
-            logger.info("提取cell embeddings...")
+            logger.info(f"提取cell embeddings (方法: {config.embedding_type})...")
         
         cell_embeddings = extract_embeddings(adata_processed, config, verbose=config.verbose)
         
@@ -370,17 +591,19 @@ def main():
         if config.verbose:
             logger.info("保存结果...")
         
-        saved_files = save_results(cell_embeddings, selected_genes, expression_bow, config, verbose=config.verbose)
+        saved_file = save_results(cell_embeddings, config, verbose=config.verbose)
         
         # 输出总结
         logger.info("=== Cell Embedding提取完成 ===")
         logger.info(f"数据集: {config.dataset_name}")
         logger.info(f"细胞数: {cell_embeddings.shape[0]}")
-        logger.info(f"基因数: {len(selected_genes)}")
         logger.info(f"Embedding维度: {cell_embeddings.shape[1]}")
-        logger.info(f"方法: {'Geneformer' if config.use_geneformer else 'PCA'}")
+        logger.info(f"方法: {config.embedding_type}")
+        if config.embedding_type == "genept":
+            logger.info(f"策略: {config.genept_strategy}")
+        logger.info(f"保存位置: {saved_file}")
         
-        return saved_files
+        return saved_file
         
     except Exception as e:
         logger.error(f"提取过程失败: {e}")

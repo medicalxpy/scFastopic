@@ -1,6 +1,8 @@
 import torch
 from torch import nn
 import torch.nn.functional as F
+from sklearn.cluster import KMeans
+import numpy as np
 
 from ._ETP import ETP
 from ._model_utils import pairwise_euclidean_distance
@@ -27,7 +29,8 @@ class fastopic(nn.Module):
              embed_size: int,
              _fitted: bool = False,
              pre_vocab: list=None,
-             vocab: list=None
+             vocab: list=None,
+             cell_embeddings: np.ndarray=None
             ):
 
         if _fitted:
@@ -36,7 +39,12 @@ class fastopic(nn.Module):
             topic_weights = self.topic_weights.data
             del self.topic_weights
         else:
-            topic_embeddings = F.normalize(nn.init.trunc_normal_(torch.empty((self.num_topics, embed_size))))
+            if cell_embeddings is not None:
+                kmeans = KMeans(n_clusters=self.num_topics, random_state=42, n_init=10)
+                kmeans.fit(cell_embeddings)
+                topic_embeddings = F.normalize(torch.tensor(kmeans.cluster_centers_, dtype=torch.float32))
+            else:
+                topic_embeddings = F.normalize(nn.init.trunc_normal_(torch.empty((self.num_topics, embed_size))))
             topic_weights = (torch.ones(self.num_topics) / self.num_topics).unsqueeze(1)
 
         self.topic_embeddings = nn.Parameter(topic_embeddings)
@@ -113,14 +121,19 @@ class fastopic(nn.Module):
         theta = transp_DT * transp_DT.shape[0]
         beta = transp_TW * transp_TW.shape[0]
 
-        # Dual Semantic-relation Reconstruction (DSR)
-        recon = torch.matmul(theta, beta)
-        loss_DSR = -(train_bow * (recon + self.epsilon).log()).sum(axis=1).mean()
-
-        loss = loss_DSR + loss_ETP
+        
+        recon_logit = torch.matmul(theta, beta)
+        train_bow_prob = train_bow / train_bow.sum(dim=-1, keepdim=True)
+        recon_prob = F.softmax(recon_logit, dim=-1)
+        loss_DSR = -(train_bow_prob * recon_prob.log()).sum(dim=-1).mean()
+        loss = loss_DSR + loss_ETP 
 
         rst_dict = {
             'loss': loss,
+            'loss_ETP': loss_ETP,
+            'loss_DSR': loss_DSR,
+            'loss_DT': loss_DT,
+            'loss_TW': loss_TW,
         }
 
         return rst_dict
