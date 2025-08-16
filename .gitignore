@@ -1,4 +1,11 @@
 /results
+/result_scETM
 visualization
 *.log
 *.md
+Geneformer
+data
+GenePT_emebdding_v2
+__pycache__/
+*/__pycache__/
+**/__pycache__/

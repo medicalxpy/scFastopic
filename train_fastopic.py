@@ -133,6 +133,11 @@ class FastopicConfig:
         # 其他参数
         self.verbose = True
         self.seed = 42
+        self.filter_genept = True  # 是否过滤到GenePT共有基因
+        
+        # 早停参数
+        self.patience = 10
+        self.min_delta = 1e-4
 
 
 def parse_args():
@@ -172,17 +177,33 @@ def parse_args():
                        help='Random seed')
     parser.add_argument('--quiet', action='store_true',
                        help='Quiet mode')
+    parser.add_argument('--patience', type=int, default=10,
+                       help='Early stopping patience')
+    parser.add_argument('--no_genept_filter', action='store_true',
+                       help='Disable GenePT gene filtering')
     
     return parser.parse_args()
 
 
-def preprocess_adata(adata_path: str, verbose: bool = False):
+def load_genept_genes():
+    """加载GenePT基因列表"""
+    try:
+        genept_path = '/root/autodl-tmp/scFastopic/GenePT_emebdding_v2/GenePT_gene_protein_embedding_model_3_text.pickle'
+        with open(genept_path, 'rb') as f:
+            genept_dict = pickle.load(f)
+        return set(genept_dict.keys())
+    except Exception as e:
+        print(f"⚠️ 无法加载GenePT基因列表: {e}")
+        return None
+
+def preprocess_adata(adata_path: str, verbose: bool = False, filter_genept: bool = True):
     """
     从adata中提取计数矩阵并进行预处理
     
     Args:
         adata_path: 单细胞数据路径
         verbose: 是否详细输出
+        filter_genept: 是否过滤到GenePT共有基因
         
     Returns:
         expression_matrix: 预处理后的表达矩阵 (cells x genes)
@@ -207,8 +228,28 @@ def preprocess_adata(adata_path: str, verbose: bool = False):
     if verbose:
         print(f"过滤后数据维度: {adata.shape}")
     
+    # GenePT基因过滤
+    if filter_genept:
+        genept_genes = load_genept_genes()
+        if genept_genes is not None:
+            # 找到与GenePT共有的基因
+            current_genes = set(adata.var_names)
+            common_genes = current_genes.intersection(genept_genes)
+            
+            if len(common_genes) > 0:
+                # 过滤到共有基因
+                adata = adata[:, list(common_genes)]
+                if verbose:
+                    print(f"🧬 GenePT基因过滤: {len(common_genes)}/{len(current_genes)} 基因保留")
+            else:
+                if verbose:
+                    print("⚠️ 没有与GenePT共有的基因，跳过基因过滤")
+    
+    if verbose:
+        print(f"最终数据维度: {adata.shape}")
+    
     # 标准化到每个细胞总计数为1e4
-    sc.pp.normalize_total(adata, target_sum=1e4)
+    sc.pp.normalize_total(adata, target_sum=1)
     
     # log1p变换
     sc.pp.log1p(adata)
@@ -228,7 +269,7 @@ def preprocess_adata(adata_path: str, verbose: bool = False):
     return expression_matrix, gene_names
 
 
-def load_embeddings_and_expression(embedding_file: str, adata_path: str, verbose: bool = False):
+def load_embeddings_and_expression(embedding_file: str, adata_path: str, verbose: bool = False, filter_genept: bool = True):
     """
     加载cell embeddings和预处理后的表达矩阵
     
@@ -236,6 +277,7 @@ def load_embeddings_and_expression(embedding_file: str, adata_path: str, verbose
         embedding_file: cell embeddings文件路径
         adata_path: 原始adata路径
         verbose: 是否详细输出
+        filter_genept: 是否过滤到GenePT共有基因
         
     Returns:
         cell_embeddings: Cell embeddings矩阵
@@ -257,7 +299,7 @@ def load_embeddings_and_expression(embedding_file: str, adata_path: str, verbose
         print(f"✅ Cell embeddings: {cell_embeddings.shape}")
     
     # 预处理adata
-    expression_matrix, gene_names = preprocess_adata(adata_path, verbose)
+    expression_matrix, gene_names = preprocess_adata(adata_path, verbose, filter_genept)
     
     # 确保细胞数量匹配
     n_cells_emb = cell_embeddings.shape[0]
@@ -273,6 +315,7 @@ def load_embeddings_and_expression(embedding_file: str, adata_path: str, verbose
         expression_matrix = expression_matrix[:min_cells]
     
     return cell_embeddings, expression_matrix, gene_names
+
 
 
 def train_fastopic_model(cell_embeddings: np.ndarray, 
@@ -309,8 +352,8 @@ def train_fastopic_model(cell_embeddings: np.ndarray,
         theta_temp=config.theta_temp,
         verbose=verbose,
         log_interval=10,
-        low_memory=True,
-        low_memory_batch_size=4000
+        low_memory=False,
+        low_memory_batch_size=8000
     )
     
     # 训练模型
@@ -321,12 +364,15 @@ def train_fastopic_model(cell_embeddings: np.ndarray,
     # 将表达矩阵转换为稀疏矩阵作为BOW输入
     expression_bow = sp.csr_matrix(expression_matrix)
     
+    # 标准训练
     top_words, train_theta = model.fit_transform_sc(
         cell_embeddings=cell_embeddings,
         gene_names=gene_names,
         expression_bow=expression_bow,
         epochs=config.epochs,
-        learning_rate=config.learning_rate
+        learning_rate=config.learning_rate,
+        patience=config.patience,
+        min_delta=config.min_delta
     )
     
     training_time = time.time() - start_time
@@ -425,6 +471,8 @@ def main():
     config.TW_alpha = args.TW_alpha
     config.theta_temp = args.theta_temp
     config.verbose = not args.quiet
+    config.patience = args.patience
+    config.filter_genept = not args.no_genept_filter
     
     # 设置随机种子
     np.random.seed(args.seed)
@@ -436,13 +484,15 @@ def main():
         print(f"  Topics: {config.n_topics}")
         print(f"  Epochs: {config.epochs}")
         print(f"  Learning Rate: {config.learning_rate}")
+        print(f"  Early stopping patience: {config.patience}")
+        print(f"  GenePT gene filtering: {config.filter_genept}")
         print(f"  Embedding file: {config.embedding_file}")
         print(f"  Adata file: {config.adata_path}")
     
     try:
         # Step 1: 加载embeddings和预处理表达数据
         cell_embeddings, expression_matrix, gene_names = load_embeddings_and_expression(
-            config.embedding_file, config.adata_path, config.verbose
+            config.embedding_file, config.adata_path, config.verbose, config.filter_genept
         )
         
         # Step 2: 训练模型
@@ -466,14 +516,8 @@ def main():
             n_topics=config.n_topics
         )
         
-        # 保存报告
-        report_file = Path(config.output_dir) / f"{config.dataset}_report_{config.n_topics}.md"
-        with open(report_file, 'w') as f:
-            f.write(report)
-        
         print(f"\n🎉 Training completed successfully!")
         print(f"📁 Results saved to: {config.output_dir}/")
-        print(f"📄 Report saved to: {report_file}")
         
         print(f"\n🎯 Final Results:")
         print(f"  Shannon Entropy: {results['shannon_entropy']:.3f}")

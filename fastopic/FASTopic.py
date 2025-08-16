@@ -112,6 +112,8 @@ class FASTopic:
         expression_bow: sp.csr_matrix = None,
         epochs: int = 200,
         learning_rate: float = 0.002,
+        patience: int = 10,
+        min_delta: float = 1e-4,
     ):
         """
         Single-cell version of fit_transform that works directly with cell embeddings.
@@ -158,7 +160,12 @@ class FASTopic:
         doc_embed_size = dataset.cell_embed_size
 
         if not _fitted:
-            self.model.init(vocab_size, doc_embed_size, cell_embeddings=cell_embeddings)
+            self.model.init(
+                vocab_size, 
+                doc_embed_size, 
+                cell_embeddings=cell_embeddings, 
+                vocab=dataset.vocab
+            )
         else:
             pre_vocab = self.vocab
             self.model.init(
@@ -177,6 +184,9 @@ class FASTopic:
 
         # Start training.
         self.model.train()
+        best_loss = float('inf')
+        patience_counter = 0
+        
         for epoch in tqdm(range(1, epochs + 1), desc="Training scFASTopic"):
             loss_rst_dict = defaultdict(float)
 
@@ -195,22 +205,30 @@ class FASTopic:
                 for key in rst_dict:
                     loss_rst_dict[key] += rst_dict[key] * batch_bow.shape[0]
 
+            avg_losses = {key: loss_rst_dict[key] / data_size for key in loss_rst_dict}
+            current_loss = avg_losses['loss']
+            
+            if current_loss < best_loss - min_delta:
+                best_loss = current_loss
+                patience_counter = 0
+            else:
+                patience_counter += 1
+            
             if epoch % self.log_interval == 0:
-                # 计算平均损失
-                avg_losses = {key: loss_rst_dict[key] / data_size for key in loss_rst_dict}
-                
-                # 构建详细的loss展示
                 if 'loss_ETP' in avg_losses and 'loss_DSR' in avg_losses:
                     output_log = f"Epoch: {epoch:03d} | Total: {avg_losses['loss']:.3f} = ETP: {avg_losses['loss_ETP']:.3f} + DSR: {avg_losses['loss_DSR']:.3f}"
                     if 'loss_DT' in avg_losses and 'loss_TW' in avg_losses:
                         output_log += f" | ETP = DT: {avg_losses['loss_DT']:.3f} + TW: {avg_losses['loss_TW']:.3f}"
                 else:
-                    # 兼容旧版本格式
                     output_log = f"Epoch: {epoch:03d}"
                     for key in loss_rst_dict:
                         output_log += f" {key}: {avg_losses[key]:.3f}"
                 
                 logger.info(output_log)
+            
+            if patience_counter >= patience:
+                logger.info(f"Early stopping at epoch {epoch}")
+                break
 
         self.beta = self.get_beta()
         self.top_words = self.get_top_words(self.num_top_words)
