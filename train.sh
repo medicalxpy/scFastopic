@@ -1,8 +1,8 @@
 #!/bin/bash
 
-dataset_name='PBMC_8k'
+dataset_name='PBMC4k'
   python train_fastopic.py \
-      --embedding_file /root/autodl-tmp/scFastopic/results/cell_embedding/${dataset_name}_scVI.pkl \
+      --embedding_file /root/autodl-tmp/scFastopic/results/cell_embedding/${dataset_name}_scvi.pkl \
       --adata_path /root/autodl-tmp/scFastopic/data/${dataset_name}.h5ad \
       --dataset ${dataset_name}_scVI \
       --n_topics 20 \
@@ -11,6 +11,8 @@ dataset_name='PBMC_8k'
       --DT_alpha 1 \
       --TW_alpha 8 \
       --theta_temp 5 \
+
+
 
 python visualization.py \
     /root/autodl-tmp/scFastopic/results/cell_embedding/PBMC12k_scVI.pkl \

@@ -1,5 +1,6 @@
 import numpy as np
 import torch
+import torch.nn.functional as F
 import pandas as pd
 import scipy.sparse as sp
 from collections import defaultdict
@@ -11,7 +12,7 @@ from . import _plot
 from ._fastopic import fastopic
 from ._utils import Logger, assert_fitted, check_fitted, DocEmbedModel, Dataset, ScDataset, get_top_words
 
-from typing import List, Union, Callable
+from typing import Dict, List, Optional, Union, Callable
 
 
 logger = Logger("WARNING")
@@ -114,6 +115,7 @@ class FASTopic:
         learning_rate: float = 0.002,
         patience: int = 10,
         min_delta: float = 1e-4,
+        init_word_embeddings: Optional[Dict[str, np.ndarray]] = None,
     ):
         """
         Single-cell version of fit_transform that works directly with cell embeddings.
@@ -166,6 +168,11 @@ class FASTopic:
                 cell_embeddings=cell_embeddings, 
                 vocab=dataset.vocab
             )
+            if init_word_embeddings is not None:
+                self._apply_initial_word_embeddings(
+                    dataset.vocab,
+                    init_word_embeddings
+                )
         else:
             pre_vocab = self.vocab
             self.model.init(
@@ -176,6 +183,8 @@ class FASTopic:
                 dataset.vocab,
                 cell_embeddings
             )
+            if init_word_embeddings is not None:
+                logger.warning("Initial word embeddings provided but model is already fitted; ignoring override.")
 
         self.vocab = dataset.vocab
         self.model = self.model.to(self.device)
@@ -426,6 +435,67 @@ class FASTopic:
             return word embeddings $V \times L$
         """
         return self.model.word_embeddings.detach().cpu().numpy()
+
+    def _apply_initial_word_embeddings(
+        self,
+        vocab: List[str],
+        init_data: Dict[str, np.ndarray],
+    ) -> None:
+        """Inject pretrained gene embeddings prior to training.
+
+        The ``init_data`` dictionary must contain an ``embeddings`` array of
+        shape ``(V_prev, D)`` and the corresponding ``vocab`` list.  An optional
+        ``weights`` array with shape ``(V_prev, 1)`` can also be provided.  The
+        embeddings are matched by gene name and copied into the model tensor.
+        Genes that do not appear in ``init_data['vocab']`` keep their initial
+        random vectors.
+        """
+
+        required_keys = {"embeddings", "vocab"}
+        missing = required_keys - set(init_data)
+        if missing:
+            raise ValueError(f"init_word_embeddings is missing keys: {missing}")
+
+        prev_vocab = init_data["vocab"]
+        prev_embeddings = init_data["embeddings"]
+        if len(prev_vocab) != len(prev_embeddings):
+            raise ValueError("Length of vocab and embeddings mismatch in initial word embeddings")
+
+        vocab_to_idx = {gene: idx for idx, gene in enumerate(prev_vocab)}
+
+        with torch.no_grad():
+            word_tensor = self.model.word_embeddings.data
+            device = word_tensor.device
+            dtype = word_tensor.dtype
+
+            matched = 0
+            for i, gene in enumerate(vocab):
+                prev_idx = vocab_to_idx.get(gene)
+                if prev_idx is None:
+                    continue
+                vec = torch.as_tensor(prev_embeddings[prev_idx], device=device, dtype=dtype)
+                if vec.shape != word_tensor[i].shape:
+                    raise ValueError("Embedding dimensionality mismatch for gene '%s'" % gene)
+                word_tensor[i] = vec
+                matched += 1
+
+            if matched:
+                word_tensor[:] = F.normalize(word_tensor, dim=1)
+
+            if "weights" in init_data:
+                weights = init_data["weights"]
+                if len(weights) != len(prev_vocab):
+                    raise ValueError("Length of weights must match vocab in initial word embeddings")
+                weight_tensor = self.model.word_weights.data
+                weight_dtype = weight_tensor.dtype
+                for i, gene in enumerate(vocab):
+                    prev_idx = vocab_to_idx.get(gene)
+                    if prev_idx is None:
+                        continue
+                    weight_tensor[i] = torch.as_tensor(weights[prev_idx], device=device, dtype=weight_dtype)
+
+        if matched == 0:
+            logger.warning("No genes matched between provided initial embeddings and current vocabulary.")
 
     @property
     def transp_DT(self):
