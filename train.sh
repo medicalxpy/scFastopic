@@ -1,6 +1,6 @@
 #!/bin/bash
 
-dataset_name='PBMC4k'
+dataset_name='PBMC8k'
   python train_fastopic.py \
       --embedding_file /root/autodl-tmp/scFastopic/results/cell_embedding/${dataset_name}_scvi.pkl \
       --adata_path /root/autodl-tmp/scFastopic/data/${dataset_name}.h5ad \
@@ -14,6 +14,6 @@ dataset_name='PBMC4k'
 
 
 
-python visualization.py \
-    /root/autodl-tmp/scFastopic/results/cell_embedding/PBMC12k_scVI.pkl \
-    --adata_path /autodl-fs/data/dataset/PBMC_12k.h5ad
+# python visualization.py \
+#     /root/autodl-tmp/scFastopic/results/cell_embedding/PBMC12k_scVI.pkl \
+#     --adata_path /autodl-fs/data/dataset/PBMC_12k.h5ad

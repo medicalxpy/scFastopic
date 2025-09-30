@@ -14,9 +14,13 @@ from ._model_utils import pairwise_euclidean_distance
 class fastopic(nn.Module):
     def __init__(self,
                  num_topics: int,
-                 theta_temp: float=1.0,
-                 DT_alpha: float=3.0,
-                 TW_alpha: float=2.0
+                 theta_temp: float = 1.0,
+                 DT_alpha: float = 3.0,
+                 TW_alpha: float = 2.0,
+                 genept_proj_dim: int = 512,
+                 genept_proj_hidden: int = 1024,
+                 genept_temperature: float = 0.1,
+                 genept_loss_weight: float = 1e-4
                 ):
         super().__init__()
 
@@ -24,8 +28,16 @@ class fastopic(nn.Module):
         self.DT_alpha = DT_alpha
         self.TW_alpha = TW_alpha
         self.theta_temp = theta_temp
+        self.genept_proj_dim = genept_proj_dim
+        self.genept_proj_hidden = genept_proj_hidden
+        self.genept_temperature = genept_temperature
+        self.genept_loss_weight = genept_loss_weight
 
         self.epsilon = 1e-12
+        self.word_projector = None
+        self.genept_projector = None
+        self._genept_embeddings = None
+        self._gene_alignment_mask = None
 
     def init(self,
              vocab_size: int,
@@ -75,12 +87,15 @@ class fastopic(nn.Module):
 
         self.word_embeddings = nn.Parameter(word_embeddings)
         self.word_weights = nn.Parameter(word_weights)
-        
+
         # 保存vocab_size用于计算权重
         self.vocab_size = vocab_size
-        
+
         # 保存词汇表用于GenePT对齐
         self._vocab = vocab
+
+        if not _fitted or self.word_projector is None:
+            self.word_projector = self._build_projector(embed_size, self.genept_proj_dim)
 
         self.DT_ETP = ETP(self.DT_alpha, init_b_dist=self.topic_weights)
         self.TW_ETP = ETP(self.TW_alpha, init_b_dist=self.word_weights)
@@ -147,8 +162,8 @@ class fastopic(nn.Module):
         
         # 添加GenePT对齐损失
         loss_genept_alignment = self._compute_genept_alignment_loss()
-        
-        loss = loss_DSR + 1e-2*loss_ETP + 1e-4*loss_genept_alignment 
+
+        loss = loss_DSR + 1e-2 * loss_ETP + self.genept_loss_weight * loss_genept_alignment
 
         rst_dict = {
             'loss': loss,
@@ -177,20 +192,34 @@ class fastopic(nn.Module):
         if self._genept_embeddings is None or self._gene_alignment_mask is None:
             return torch.tensor(0.0, device=self.word_embeddings.device)
         
-        # 计算对齐的基因的embedding距离
-        # 只对能匹配到GenePT的基因计算损失
         aligned_word_embeddings = self.word_embeddings[self._gene_alignment_mask]
-        aligned_genept_embeddings = self._genept_embeddings.to(self.word_embeddings.device)
-        
-        # 使用余弦相似度损失 (1 - cosine_similarity)
-        # 或者使用L2距离
-        cosine_sim = F.cosine_similarity(aligned_word_embeddings, aligned_genept_embeddings, dim=1)
-        alignment_loss = (1.0 - cosine_sim).mean()
-        
-        # 调节损失权重
-        genept_alpha = 0.1  # 可调节的权重参数
-        
-        return genept_alpha * alignment_loss
+        device = aligned_word_embeddings.device
+
+        if self.word_projector is None:
+            self.word_projector = self._build_projector(aligned_word_embeddings.shape[1], self.genept_proj_dim).to(device)
+        else:
+            self.word_projector = self.word_projector.to(device)
+
+        genept_embeddings = self._genept_embeddings.to(device)
+        if self.genept_projector is None:
+            self.genept_projector = self._build_projector(genept_embeddings.shape[1], self.genept_proj_dim).to(device)
+        else:
+            self.genept_projector = self.genept_projector.to(device)
+
+        word_proj = self.word_projector(aligned_word_embeddings)
+        gene_proj = self.genept_projector(genept_embeddings)
+
+        word_proj = F.normalize(word_proj, dim=1)
+        gene_proj = F.normalize(gene_proj, dim=1)
+
+        logits = torch.matmul(word_proj, gene_proj.t()) / self.genept_temperature
+        targets = torch.arange(logits.size(0), device=device)
+
+        loss_i = F.cross_entropy(logits, targets)
+        loss_j = F.cross_entropy(logits.t(), targets)
+        alignment_loss = 0.5 * (loss_i + loss_j)
+
+        return alignment_loss
     
     def _load_genept_embeddings(self):
         """
@@ -216,6 +245,9 @@ class fastopic(nn.Module):
                 self._genept_embeddings = torch.stack(aligned_embeddings)
                 self._gene_alignment_mask = torch.tensor(alignment_mask, dtype=torch.long)
                 print(f"✅ GenePT对齐: {len(aligned_embeddings)}/{len(self._vocab)} 基因匹配")
+                if self.genept_projector is None:
+                    in_dim = self._genept_embeddings.shape[1]
+                    self.genept_projector = self._build_projector(in_dim, self.genept_proj_dim)
             else:
                 self._genept_embeddings = None
                 self._gene_alignment_mask = None
@@ -225,3 +257,14 @@ class fastopic(nn.Module):
             print(f"❌ 加载GenePT嵌入失败: {e}")
             self._genept_embeddings = None
             self._gene_alignment_mask = None
+
+    def _build_projector(self, in_dim: int, out_dim: int) -> nn.Module:
+        hidden_dim = self.genept_proj_hidden if self.genept_proj_hidden and self.genept_proj_hidden > 0 else None
+        if hidden_dim and hidden_dim != in_dim and hidden_dim != out_dim:
+            return nn.Sequential(
+                nn.Linear(in_dim, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, out_dim)
+            )
+        else:
+            return nn.Linear(in_dim, out_dim)

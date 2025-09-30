@@ -3,7 +3,6 @@
 FASTopic训练脚本
 使用预提取的cell embeddings和原始adata训练scFASTopic模型
 """
-import os
 import argparse
 import numpy as np
 import pandas as pd
@@ -49,51 +48,6 @@ def save_matrices(matrices, dataset_name, n_topics, output_dir):
         print(f"💾 Saved {matrix_name}: {filepath}")
     
     return saved_files
-
-def calculate_topic_metrics(cell_topic_matrix):
-    """计算topic质量指标"""
-    from scipy.stats import entropy
-    
-    # 处理NaN值
-    if np.isnan(cell_topic_matrix).any():
-        print("⚠️ Warning: Found NaN values in cell-topic matrix for metrics calculation")
-        cell_topic_matrix = np.nan_to_num(cell_topic_matrix, nan=0.0)
-    
-    topic_weights = cell_topic_matrix.mean(axis=0)
-    shannon_entropy = entropy(topic_weights + 1e-12, base=2)
-    effective_topics = 2**shannon_entropy
-    dominant_topic_ratio = topic_weights.max() * 100
-    
-    return {
-        'shannon_entropy': shannon_entropy,
-        'effective_topics': effective_topics,
-        'dominant_topic_ratio': dominant_topic_ratio,
-        'topic_weights': topic_weights
-    }
-
-def create_summary_report(matrices, metrics, dataset_name, n_topics):
-    """创建摘要报告"""
-    report = f"""# scFASTopic Training Report
-
-## Dataset Information
-- Dataset: {dataset_name}
-- Number of topics: {n_topics}
-- Number of cells: {matrices['cell_topic_matrix'].shape[0]:,}
-- Number of genes: {matrices['topic_gene_matrix'].shape[1]:,}
-
-## Model Performance
-- Shannon Entropy: {metrics['shannon_entropy']:.3f}
-- Effective Topics: {metrics['effective_topics']:.1f}
-- Dominant Topic Ratio: {metrics['dominant_topic_ratio']:.1f}%
-
-## Matrix Shapes
-- Cell-topic matrix: {matrices['cell_topic_matrix'].shape}
-- Topic-gene matrix: {matrices['topic_gene_matrix'].shape}
-- Gene embeddings: {matrices['gene_embeddings'].shape}
-- Topic embeddings: {matrices['topic_embeddings'].shape}
-"""
-    return report
-
 def validate_matrices(matrices):
     """验证矩阵形状和内容"""
     try:
@@ -108,36 +62,26 @@ def validate_matrices(matrices):
     except Exception as e:
         print(f"❌ Matrix validation error: {e}")
         return False
+from dataclasses import dataclass
 
 
+@dataclass
 class FastopicConfig:
-    """FASTopic训练配置类"""
-    
-    def __init__(self):
-        # 输入输出
-        self.embedding_file = None
-        self.adata_path = None
-        self.dataset = 'PBMC'
-        self.output_dir = 'results'
-        
-        # 模型参数
-        self.n_topics = 20
-        self.epochs = 100
-        self.learning_rate = 0.01
-        
-        # FASTopic超参数
-        self.DT_alpha = 1.0
-        self.TW_alpha = 1.0
-        self.theta_temp = 2.0
-        
-        # 其他参数
-        self.verbose = True
-        self.seed = 42
-        self.filter_genept = True  # 是否过滤到GenePT共有基因
-        
-        # 早停参数
-        self.patience = 10
-        self.min_delta = 1e-4
+    embedding_file: Optional[str] = None
+    adata_path: Optional[str] = None
+    dataset: str = "PBMC"
+    output_dir: str = "results"
+    n_topics: int = 20
+    epochs: int = 100
+    learning_rate: float = 0.01
+    DT_alpha: float = 1.0
+    TW_alpha: float = 1.0
+    theta_temp: float = 2.0
+    verbose: bool = True
+    seed: int = 42
+    filter_genept: bool = True
+    patience: int = 10
+    min_delta: float = 1e-4
 
 
 def parse_args():
@@ -183,6 +127,25 @@ def parse_args():
                        help='Disable GenePT gene filtering')
     
     return parser.parse_args()
+
+
+def config_from_args(args: argparse.Namespace) -> FastopicConfig:
+    return FastopicConfig(
+        embedding_file=args.embedding_file,
+        adata_path=args.adata_path,
+        dataset=args.dataset,
+        output_dir=args.output_dir,
+        n_topics=args.n_topics,
+        epochs=args.epochs,
+        learning_rate=args.lr,
+        DT_alpha=args.DT_alpha,
+        TW_alpha=args.TW_alpha,
+        theta_temp=args.theta_temp,
+        verbose=not args.quiet,
+        seed=args.seed,
+        filter_genept=not args.no_genept_filter,
+        patience=args.patience,
+    )
 
 
 def load_genept_genes():
@@ -318,11 +281,13 @@ def load_embeddings_and_expression(embedding_file: str, adata_path: str, verbose
 
 
 
-def train_fastopic_model(cell_embeddings: np.ndarray, 
-                        expression_matrix: np.ndarray,
-                        gene_names: List[str],
-                        config: FastopicConfig,
-                        verbose: bool = False):
+def train_fastopic_model(
+    cell_embeddings: np.ndarray,
+    expression_matrix: np.ndarray,
+    gene_names: List[str],
+    config: FastopicConfig,
+    verbose: bool = False,
+):
     """
     训练scFASTopic模型
     
@@ -374,9 +339,9 @@ def train_fastopic_model(cell_embeddings: np.ndarray,
         patience=config.patience,
         min_delta=config.min_delta
     )
-    
+
     training_time = time.time() - start_time
-    
+
     # 获取结果矩阵
     beta = model.get_beta()  # topic-gene matrix
     theta = train_theta      # cell-topic matrix
@@ -402,33 +367,39 @@ def train_fastopic_model(cell_embeddings: np.ndarray,
         'shannon_entropy': shannon_entropy,
         'effective_topics': effective_topics,
         'dominant_topic_ratio': dominant_topic_ratio,
-        'model': model
     }
-    
+
     if verbose:
         print(f"✅ Training completed in {training_time:.1f} seconds")
         print(f"📊 Shannon Entropy: {shannon_entropy:.3f}")
         print(f"🎯 Effective Topics: {effective_topics:.1f}")
         print(f"👑 Dominant Topic: {dominant_topic_ratio:.1f}%")
-    
-    return results, training_time
+
+    return model, results, training_time
 
 
-def save_all_matrices(results: dict,
-                     cell_embeddings: np.ndarray,
-                     config: FastopicConfig,
-                     verbose: bool = False):
+def save_all_matrices(
+    model,
+    results: dict,
+    config: FastopicConfig,
+    verbose: bool = False,
+):
     """保存所有矩阵"""
     if verbose:
         print("\n💾 Saving matrices")
         print("="*60)
     
     # 准备需要保存的矩阵（仅保存用户需要的4种）
+    def _to_numpy(arr):
+        if isinstance(arr, torch.Tensor):
+            return arr.detach().cpu().numpy()
+        return np.asarray(arr)
+
     matrices = {
-        'cell_topic_matrix': results['theta'],  # FASTopic返回的cell-topic矩阵
-        'topic_gene_matrix': results['beta'],   # FASTopic返回的topic-gene矩阵
-        'gene_embeddings': results['model'].word_embeddings,  # 从模型获取基因嵌入
-        'topic_embeddings': results['model'].topic_embeddings  # 从模型获取主题嵌入
+        'cell_topic_matrix': results['theta'],
+        'topic_gene_matrix': results['beta'],
+        'gene_embeddings': _to_numpy(model.word_embeddings),
+        'topic_embeddings': _to_numpy(model.topic_embeddings),
     }
     
     # 验证矩阵
@@ -442,8 +413,8 @@ def save_all_matrices(results: dict,
         n_topics=config.n_topics,
         output_dir=config.output_dir
     )
-    
-    return saved_files, matrices
+
+    return saved_files
 
 
 
@@ -456,27 +427,11 @@ def main():
     # 解析参数
     args = parse_args()
     
-    # 创建配置
-    config = FastopicConfig()
-    
-    # 更新配置
-    config.embedding_file = args.embedding_file
-    config.adata_path = args.adata_path
-    config.dataset = args.dataset
-    config.output_dir = args.output_dir
-    config.n_topics = args.n_topics
-    config.epochs = args.epochs
-    config.learning_rate = args.lr
-    config.DT_alpha = args.DT_alpha
-    config.TW_alpha = args.TW_alpha
-    config.theta_temp = args.theta_temp
-    config.verbose = not args.quiet
-    config.patience = args.patience
-    config.filter_genept = not args.no_genept_filter
-    
+    config = config_from_args(args)
+
     # 设置随机种子
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
+    np.random.seed(config.seed)
+    torch.manual_seed(config.seed)
     
     if config.verbose:
         print(f"📊 Configuration:")
@@ -496,26 +451,15 @@ def main():
         )
         
         # Step 2: 训练模型
-        results, training_time = train_fastopic_model(
+        model, results, training_time = train_fastopic_model(
             cell_embeddings, expression_matrix, gene_names, config, config.verbose
         )
-        
+
         # Step 3: 保存矩阵
-        saved_files, matrices = save_all_matrices(
-            results, cell_embeddings, config, config.verbose
+        saved_files = save_all_matrices(
+            model, results, config, config.verbose
         )
-        
-        # Step 4: 计算指标和生成报告
-        metrics = calculate_topic_metrics(results['theta'])
-        
-        # 创建报告
-        report = create_summary_report(
-            matrices=matrices,
-            metrics=metrics,
-            dataset_name=config.dataset,
-            n_topics=config.n_topics
-        )
-        
+
         print(f"\n🎉 Training completed successfully!")
         print(f"📁 Results saved to: {config.output_dir}/")
         
