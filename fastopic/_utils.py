@@ -1,10 +1,9 @@
 import numpy as np
 import torch
 import scipy.sparse as sp
-from sentence_transformers import SentenceTransformer
 
 import logging
-from typing import List, Callable
+from typing import List
 
 
 def get_top_words(beta, vocab, num_top_words, verbose=False):
@@ -17,31 +16,6 @@ def get_top_words(beta, vocab, num_top_words, verbose=False):
             print('Topic {}: {}'.format(i, topic_str))
 
     return topic_str_list
-
-
-class DocEmbedModel:
-    def __init__(
-        self,
-        model: str="all-MiniLM-L6-v2",
-        device: str="cpu",
-        normalize_embeddings: bool = False,
-        verbose: bool = False,
-    ):
-        self.verbose = verbose
-        self.normalize_embeddings = normalize_embeddings
-
-        if isinstance(model, str):
-            self.model = SentenceTransformer(model, device=device)
-        else:
-            self.model = model
-
-    def encode(self, docs: List[str]) -> np.ndarray:
-        embeddings = self.model.encode(
-            docs,
-            show_progress_bar=self.verbose,
-            normalize_embeddings=self.normalize_embeddings
-        )
-        return embeddings
 
 
 class DataIterator:
@@ -99,32 +73,6 @@ class DataIterator:
             batch_doc_embed = self.doc_embeddings[batch_indices]
             
             yield batch_bow, batch_doc_embed
-
-
-class Dataset:
-    def __init__(
-        self,
-        docs: List[str],
-        doc_embedder: Callable,
-        preprocess: Callable,
-        batch_size: int=200,
-        device: str="cpu",
-        low_memory: bool = False,
-        preset_doc_embeddings=None
-    ):
-        rst = preprocess.preprocess(docs)
-        self.train_bow = rst['train_bow']
-        self.vocab = rst['vocab']
-
-        self.vocab_size = len(self.vocab)
-
-        if preset_doc_embeddings is None:
-            self.doc_embeddings = doc_embedder.encode(docs)
-        else:
-            self.doc_embeddings = preset_doc_embeddings
-
-        self.doc_embed_size = self.doc_embeddings.shape[1]
-        self.dataloader = DataIterator(self.train_bow, self.doc_embeddings, batch_size, device, low_memory)
 
 
 class ScDataset:

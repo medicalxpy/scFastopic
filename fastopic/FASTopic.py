@@ -10,9 +10,9 @@ from tqdm import tqdm
 
 from . import _plot
 from ._fastopic import fastopic
-from ._utils import Logger, assert_fitted, check_fitted, DocEmbedModel, Dataset, ScDataset, get_top_words
+from ._utils import Logger, assert_fitted, check_fitted, ScDataset, get_top_words
 
-from typing import Dict, List, Optional, Union, Callable
+from typing import Dict, List, Optional
 
 
 logger = Logger("WARNING")
@@ -22,11 +22,8 @@ class FASTopic:
     def __init__(
         self,
         num_topics: int,
-        preprocess: Callable = None,
         num_top_words: int = 15,
         device: str = None,
-        normalize_embeddings: bool = False,
-        doc_embed_model: Union[str, callable] = "all-MiniLM-L6-v2",
         DT_alpha: float = 3.0,
         TW_alpha: float = 2.0,
         theta_temp: float = 1.0,
@@ -35,27 +32,17 @@ class FASTopic:
         verbose: bool = False,
         log_interval: int = 10,
     ):
-        """FASTopic initialization.
+        """FASTopic initialization (single-cell focused).
 
         Args:
             num_topics: The number of topics.
-            preprocess: preprocess class from topmost.preprocess.Preprocess or user-defined module.
-            doc_embed_model: The used document embedding model.
-                             This can be your callable model that implements `.encode(docs)`.
-                             This can also be a model name in sentence-transformers.
-                             The default is "all-MiniLM-L6-v2".
-            num_top_words: The number of top words to be returned in topics.
-            DT_alpha: The sinkhorn alpha between document embeddings and topic embeddings.
-            TW_alpha: The sinkhorn alpha between topic embeddings and word embeddings.
-            theta_temp: The temperature parameter of the softmax used
-                        to compute doc topic distributions during testing.
-            device: The device.
-            normalize_embeddings: Set this to True to normalize document embeddings.
-                                This parameter may not be effective
-                                when you use your own document embedding model.
-            log_interval: The interval to print logs during training.
-            verbose: Changes the verbosity of the model, Set to True if you want
-                     to track the stages of the model.
+            num_top_words: Number of top words to be returned in topics.
+            DT_alpha: Sinkhorn alpha between document (cell) embeddings and topic embeddings.
+            TW_alpha: Sinkhorn alpha between topic embeddings and word (gene) embeddings.
+            theta_temp: Temperature parameter when computing topic distributions.
+            device: The device (cuda/cpu).
+            log_interval: Interval to print logs during training.
+            verbose: Verbosity.
         """
 
         if device is None:
@@ -63,20 +50,12 @@ class FASTopic:
         self.device = device
 
         self.num_top_words = num_top_words
-        self.doc_embed_model = doc_embed_model
-        self.normalize_embeddings = normalize_embeddings
         self.low_memory = low_memory
         self.low_memory_batch_size = low_memory_batch_size
 
         self.beta = None
         self.train_theta = None
         self.model = fastopic(num_topics, theta_temp, DT_alpha, TW_alpha)
-
-        if preprocess is None:
-            from topmost import Preprocess
-            self.preprocess = Preprocess(verbose=verbose)
-        else:
-            self.preprocess = preprocess
 
         self.log_interval = log_interval
         self.verbose = verbose
@@ -95,16 +74,6 @@ class FASTopic:
 
         optimizer = torch.optim.Adam(**args_dict)
         return optimizer
-
-    def fit(
-        self,
-        docs: List[str],
-        epochs: int = 200,
-        learning_rate: float = 0.002,
-        preset_doc_embeddings: np.ndarray = None,
-    ):
-        self.fit_transform(docs, epochs, learning_rate, preset_doc_embeddings)
-        return self2
 
     def fit_transform_sc(
         self,
@@ -240,150 +209,11 @@ class FASTopic:
                 break
 
         self.beta = self.get_beta()
+
         self.top_words = self.get_top_words(self.num_top_words)
         self.train_theta = self.transform_sc(self.train_doc_embeddings)
 
         return self.top_words, self.train_theta
-
-    def fit_transform(
-        self,
-        docs: List[str],
-        epochs: int = 200,
-        learning_rate: float = 0.002,
-        preset_doc_embeddings: np.ndarray = None,
-    ):
-        """
-        docs: A list of documents to be used for training.
-        epochs: The number of epochs.
-        learning_rate: The learning rate.
-        preset_doc_embeddings: If you have precomputed document embeddings,
-                              you can pass them here to avoid recomputing.
-                              This should be a numpy array of shape (N, D),
-                              where N is the number of documents and D is the embedding dimension.
-        """
-        # Preprocess docs
-        data_size = len(docs)
-        if self.low_memory:
-            logger.info("Using low memory mode.")
-            assert self.low_memory_batch_size is not None
-            self.batch_size = self.low_memory_batch_size
-            dataset_device = 'cpu'
-        else:
-            self.batch_size = data_size
-            dataset_device = self.device
-
-        # Fine-tune the model if it is already fitted.
-        if check_fitted(self):
-            logger.info("Fine-tuning the model.")
-            _fitted = True
-        else:
-            logger.info("First fit the model.")
-            _fitted = False
-
-        # Create doc_embedder.
-        self.doc_embedder = DocEmbedModel(self.doc_embed_model, self.device, self.normalize_embeddings, self.verbose)
-
-        # Create the dataset.
-        dataset = Dataset(
-            docs,
-            doc_embedder=self.doc_embedder,
-            preprocess=self.preprocess,
-            batch_size=self.batch_size,
-            device=dataset_device,
-            low_memory=self.low_memory,
-            preset_doc_embeddings=preset_doc_embeddings
-        )
-
-        self.train_doc_embeddings = torch.as_tensor(dataset.doc_embeddings)
-        if not self.low_memory:
-            self.train_doc_embeddings = self.train_doc_embeddings.to(self.device)
-
-        vocab_size = dataset.vocab_size
-        doc_embed_size = dataset.doc_embed_size
-
-        if not _fitted:
-            self.model.init(vocab_size, doc_embed_size)
-        else:
-            pre_vocab = self.vocab
-            self.model.init(
-                vocab_size,
-                doc_embed_size,
-                _fitted,
-                pre_vocab,
-                dataset.vocab
-            )
-
-        self.vocab = dataset.vocab
-        self.model = self.model.to(self.device)
-
-        optimizer = self.make_optimizer(learning_rate)
-
-        # Start training.
-        self.model.train()
-        for epoch in tqdm(range(1, epochs + 1), desc="Training FASTopic"):
-            loss_rst_dict = defaultdict(float)
-
-            for batch_bow, batch_doc_embed in dataset.dataloader:
-                if self.low_memory:
-                    batch_doc_embed = batch_doc_embed.to(self.device)
-                    batch_bow = batch_bow.to(self.device)
-
-                rst_dict = self.model(batch_bow, batch_doc_embed)
-                batch_loss = rst_dict["loss"]
-
-                optimizer.zero_grad()
-                batch_loss.backward()
-                optimizer.step()
-
-                for key in rst_dict:
-                    loss_rst_dict[key] += rst_dict[key] * batch_bow.shape[0]
-
-            if epoch % self.log_interval == 0:
-                # 计算平均损失
-                avg_losses = {key: loss_rst_dict[key] / data_size for key in loss_rst_dict}
-                
-                # 构建详细的loss展示
-                if 'loss_ETP' in avg_losses and 'loss_DSR' in avg_losses:
-                    output_log = f"Epoch: {epoch:03d} | Total: {avg_losses['loss']:.3f} = ETP: {avg_losses['loss_ETP']:.3f} + DSR: {avg_losses['loss_DSR']:.3f}"
-                    if 'loss_DT' in avg_losses and 'loss_TW' in avg_losses:
-                        output_log += f" | ETP = DT: {avg_losses['loss_DT']:.3f} + TW: {avg_losses['loss_TW']:.3f}"
-                else:
-                    # 兼容旧版本格式
-                    output_log = f"Epoch: {epoch:03d}"
-                    for key in loss_rst_dict:
-                        output_log += f" {key}: {avg_losses[key]:.3f}"
-                
-                logger.info(output_log)
-
-        self.beta = self.get_beta()
-        self.top_words = self.get_top_words(self.num_top_words)
-        self.train_theta = self.transform(self, self.train_doc_embeddings)
-
-        return self.top_words, self.train_theta
-
-    def transform(
-            self,
-            docs: List[str]=None,
-            doc_embeddings: np.ndarray=None
-        ):
-
-        if docs is None and doc_embeddings is None:
-            raise ValueError("Must set either docs or doc_embeddings.")
-
-        if doc_embeddings is None and self.doc_embedder is None:
-            raise ValueError("Must set doc embeddings.")
-
-        if doc_embeddings is None:
-            doc_embeddings = torch.as_tensor(self.doc_embedder.encode(docs))
-            if not self.low_memory:
-                doc_embeddings = doc_embeddings.to(self.device)
-
-        with torch.no_grad():
-            self.model.eval()
-            theta = self.model.get_theta(doc_embeddings, self.train_doc_embeddings)
-            theta = theta.detach().cpu().numpy()
-
-        return theta
     
     def transform_sc(self, cell_embeddings: np.ndarray):
         """
@@ -510,7 +340,7 @@ class FASTopic:
     ):
         """Saves the FASTopic model and its PyTorch model weights to the specified path, like `./fastopic.zip`.
 
-        This method saves the dict attributes of the FASTopic object (`self`) except for `doc_embedder` for lower size.
+        This method saves the dict attributes of the FASTopic object (`self`).
 
         Args:
             path (str): The path to save the model files. If the directory doesn't exist, it will be created.
@@ -525,10 +355,7 @@ class FASTopic:
         if not parent_dir.exists():
             parent_dir.mkdir(parents=True, exist_ok=True)
 
-        instance_dict = {}
-        for key, value in self.__dict__.items():
-            if key not in ['doc_embedder']:
-                instance_dict[key] = value
+        instance_dict = {k: v for k, v in self.__dict__.items()}
 
         state = {
             "instance_dict": instance_dict
@@ -539,28 +366,11 @@ class FASTopic:
     def from_pretrained(
             cls,
             path: str,
-            preprocess: Callable = None,
             low_memory: bool = None,
             low_memory_batch_size: int = None,
             device: str=None
         ):
-        """Loads a pre-trained FASTopic model from a saved file.
-
-        This method loads a previously saved FASTopic model instance, and rebuilds the `doc_embedder`.
-
-        Args:
-            path: The path to the directory containing the serialized FASTopic object `fastopic.zip`.
-            device: Move the loaded model to the device.
-                    Make sure that the device is the same
-                    if FASTopic was saved with your own document embedding model.
-                    For instance, you must set `device="cuda"` if your own document embedding models was on GPU.
-                    The device can be others if you use models in sentence-transformers.
-        Returns:
-            FASTopic: An instance of the FASTopic class loaded from the provided file.
-
-        Raises:
-            FileNotFoundError: If the specified `path` does not exist.
-        """
+        """Loads a pre-trained FASTopic model from a saved file (single-cell variant)."""
 
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -569,8 +379,6 @@ class FASTopic:
 
         instance_dict = state["instance_dict"]
         instance_dict["device"] = device
-        if preprocess:
-            instance_dict["preprocess"] = preprocess
         if low_memory:
             instance_dict["low_memory"] = low_memory
             instance_dict["low_memory_batch_size"] = low_memory_batch_size
@@ -585,12 +393,6 @@ class FASTopic:
 
         instance = cls.__new__(cls)
         instance.__dict__.update(instance_dict)
-
-        instance.doc_embedder = DocEmbedModel(
-            instance_dict["doc_embed_model"],
-            device=instance_dict["device"],
-            normalize_embeddings=instance_dict["normalize_embeddings"]
-        )
 
         if instance.verbose:
             logger.set_level("DEBUG")
