@@ -28,7 +28,8 @@ def save_matrices(matrices, dataset_name, n_topics, output_dir):
         'cell_topic_matrix': 'cell_topic',
         'topic_gene_matrix': 'topic_gene', 
         'gene_embeddings': 'gene_embedding',
-        'topic_embeddings': 'topic_embedding'
+        'topic_embeddings': 'topic_embedding',
+        'gene_names': 'gene_embedding',
     }
     
     saved_files = []
@@ -401,6 +402,17 @@ def save_all_matrices(
         'gene_embeddings': _to_numpy(model.word_embeddings),
         'topic_embeddings': _to_numpy(model.topic_embeddings),
     }
+
+    # Also persist gene names used for this run to enable
+    # downstream topic-gene alignment across datasets.
+    try:
+        gene_names = getattr(model, 'vocab', None)
+        if gene_names is None:
+            raise AttributeError('model.vocab not available')
+        matrices['gene_names'] = list(gene_names)
+    except Exception as e:
+        if verbose:
+            print(f"⚠️ Could not capture gene_names for persistence: {e}")
     
     # 验证矩阵
     if not validate_matrices(matrices):

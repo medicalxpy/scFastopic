@@ -85,6 +85,7 @@ class FASTopic:
         patience: int = 10,
         min_delta: float = 1e-4,
         init_word_embeddings: Optional[Dict[str, np.ndarray]] = None,
+        reinit_topics: bool = False,
     ):
         """
         Single-cell version of fit_transform that works directly with cell embeddings.
@@ -105,10 +106,15 @@ class FASTopic:
             self.batch_size = data_size
             dataset_device = self.device
 
-        # Fine-tune the model if it is already fitted.
-        if check_fitted(self):
-            logger.info("Fine-tuning the model.")
+        # Determine (re)initialization strategy.
+        # If reinit_topics is True, we will reinitialize topics even if the model was fitted.
+        previously_fitted = check_fitted(self)
+        if previously_fitted and not reinit_topics:
+            logger.info("Fine-tuning the model (reuse topics).")
             _fitted = True
+        elif previously_fitted and reinit_topics:
+            logger.info("Fine-tuning with topic reinitialization (reuse words via init_word_embeddings if provided).")
+            _fitted = False
         else:
             logger.info("First fit the model.")
             _fitted = False
@@ -132,9 +138,9 @@ class FASTopic:
 
         if not _fitted:
             self.model.init(
-                vocab_size, 
-                doc_embed_size, 
-                cell_embeddings=cell_embeddings, 
+                vocab_size,
+                doc_embed_size,
+                cell_embeddings=cell_embeddings,
                 vocab=dataset.vocab
             )
             if init_word_embeddings is not None:
